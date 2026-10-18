@@ -1,0 +1,10 @@
+{
+  "description": "Track and manage your purchased items with expiration dates, calculate depreciation, and share insights with family members for better budgeting.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
