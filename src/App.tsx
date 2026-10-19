@@ -1,6 +1,6 @@
 import { createElement, useState, type ChangeEvent, type ReactNode } from "react";
 
-type Page = "home" | "items" | "lists" | "members" | "detail" | "add-item" | "add-list" | "profile" | "settings" | "year-plan" | "member-profile" | "notification-detail" | "add-quarter-plan" | "add-expense" | "subscriptions";
+type Page = "home" | "items" | "lists" | "members" | "detail" | "add-item" | "add-list" | "profile" | "settings" | "year-plan" | "member-profile" | "notification-detail" | "add-quarter-plan" | "add-expense" | "subscriptions" | "edit-profile" | "line-login";
 type IconName =
   | "home" | "box" | "list" | "users" | "bell" | "chevron" | "plus"
   | "phone" | "chair" | "coffee" | "check" | "clock" | "cart" | "card"
@@ -85,6 +85,8 @@ export default function App() {
   const [selectedNotificationId, setSelectedNotificationId] = useState(1);
   const [selectedMember, setSelectedMember] = useState("แม่");
   const [selectedQuarter, setSelectedQuarter] = useState("Q2");
+  const [profile, setProfile] = useState({ name: "พีรพัฒน์", email: "peeraphat@keeply.family", phone: "081-234-5678", birthday: "1992-08-18", bio: "ดูแลของใช้และแผนค่าใช้จ่ายของบ้าน" });
+  const [lineConnected, setLineConnected] = useState(false);
 
   const notify = (message: string) => {
     setNotice(message);
@@ -107,7 +109,11 @@ export default function App() {
         ) : page === "add-list" ? (
           <AddSharedListPage onBack={() => setPage("lists")} onSave={() => { notify("เพิ่มรายการร่วมกันเรียบร้อยแล้ว"); setPage("lists"); }} />
         ) : page === "profile" ? (
-          <ProfilePage onBack={() => setPage("members")} openSettings={() => setPage("settings")} notify={notify} />
+          <ProfilePage profile={profile} lineConnected={lineConnected} onBack={() => setPage("members")} openEdit={() => setPage("edit-profile")} openLine={() => setPage("line-login")} openSettings={() => setPage("settings")} notify={notify} />
+        ) : page === "edit-profile" ? (
+          <EditProfilePage profile={profile} onBack={() => setPage("profile")} onSave={(value) => { setProfile(value); notify("บันทึกโปรไฟล์เรียบร้อยแล้ว"); setPage("profile"); }} />
+        ) : page === "line-login" ? (
+          <LineLoginPage connected={lineConnected} profileName={profile.name} onBack={() => setPage("profile")} onConnected={() => { setLineConnected(true); notify("เชื่อมต่อบัญชี LINE เรียบร้อยแล้ว"); setPage("profile"); }} onDisconnected={() => { setLineConnected(false); notify("ยกเลิกการเชื่อมต่อ LINE แล้ว"); setPage("profile"); }} />
         ) : page === "settings" ? (
           <SettingsPage onBack={() => setPage("profile")} notify={notify} />
         ) : page === "year-plan" ? (
@@ -858,22 +864,152 @@ function SubscriptionsPage({ onBack, notify }: { onBack: () => void; notify: (me
   );
 }
 
-function ProfilePage({ onBack, openSettings, notify }: { onBack: () => void; openSettings: () => void; notify: (message: string) => void }) {
+function EditProfilePage({ profile, onBack, onSave }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; onBack: () => void; onSave: (value: { name: string; email: string; phone: string; birthday: string; bio: string }) => void }) {
+  const [name, setName] = useState(profile.name);
+  const [email, setEmail] = useState(profile.email);
+  const [phone, setPhone] = useState(profile.phone);
+  const [birthday, setBirthday] = useState(profile.birthday);
+  const [bio, setBio] = useState(profile.bio);
+  const [visibility, setVisibility] = useState("สมาชิกในบ้าน");
+
+  return (
+    <div className="min-h-screen pb-8">
+      <SecondaryHeader title="แก้ไขโปรไฟล์" onBack={onBack} />
+      <main className="px-4 pt-5 sm:px-6">
+        <section className="rounded-3xl border border-slate-200 bg-white p-5 text-center shadow-sm">
+          <div className="relative mx-auto w-fit">
+            <div className="flex size-24 items-center justify-center rounded-full bg-gradient-to-br from-sky-200 to-sky-100 text-3xl font-bold text-sky-800 ring-4 ring-sky-50">{name.trim().charAt(0) || "พ"}</div>
+            <Button ariaLabel="เปลี่ยนรูปโปรไฟล์" className="absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-sky-700 text-white shadow-lg ring-4 ring-white"><Icon name="camera" className="size-4" /></Button>
+          </div>
+          <p className="mt-4 text-sm font-semibold">รูปโปรไฟล์</p>
+          <p className="mt-1 text-[10px] text-slate-400">รองรับ JPG หรือ PNG ขนาดไม่เกิน 5 MB</p>
+        </section>
+
+        <section className="mt-4 space-y-5 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div><Heading level={2} className="text-base font-bold">ข้อมูลส่วนตัว</Heading><p className="mt-1 text-[10px] text-slate-400">ข้อมูลนี้ใช้แสดงกับสมาชิกภายในบ้าน</p></div>
+          <Field label="ชื่อที่แสดง" hint="จำเป็น"><Input value={name} onChange={setName} placeholder="ชื่อของคุณ" /></Field>
+          <Field label="อีเมล"><Input value={email} onChange={setEmail} type="email" placeholder="name@example.com" /></Field>
+          <Field label="เบอร์โทรศัพท์"><Input value={phone} onChange={setPhone} type="tel" placeholder="08x-xxx-xxxx" /></Field>
+          <Field label="วันเกิด"><Input value={birthday} onChange={setBirthday} type="date" /></Field>
+          <Field label="แนะนำตัว" hint={`${bio.length}/80`}><Input value={bio} onChange={(value) => setBio(value.slice(0, 80))} placeholder="เล่าเกี่ยวกับหน้าที่ของคุณในบ้าน" /></Field>
+        </section>
+
+        <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <Field label="การมองเห็นโปรไฟล์">
+            <div className="space-y-2">
+              {[
+                ["สมาชิกในบ้าน", "ชื่อ รูป และกิจกรรมจะแสดงกับทุกคนในบ้าน"],
+                ["เฉพาะผู้ดูแล", "ข้อมูลติดต่อจะแสดงกับเจ้าของบ้านเท่านั้น"],
+              ].map(([label, detail]) => (
+                <Button key={label} onClick={() => setVisibility(label)} className={`flex w-full items-center gap-3 rounded-2xl p-3 text-left ring-1 ${visibility === label ? "bg-sky-50 ring-sky-300" : "bg-slate-50 ring-slate-200"}`}>
+                  <span className={`flex size-5 shrink-0 items-center justify-center rounded-full border ${visibility === label ? "border-sky-600 bg-sky-600 text-white" : "border-slate-300"}`}>{visibility === label && <Icon name="check" className="size-3" />}</span>
+                  <span><span className="block text-xs font-semibold">{label}</span><span className="mt-0.5 block text-[9px] text-slate-400">{detail}</span></span>
+                </Button>
+              ))}
+            </div>
+          </Field>
+        </section>
+
+        <Button onClick={name.trim() && email.trim() ? () => onSave({ name, email, phone, birthday, bio }) : undefined} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold ${name.trim() && email.trim() ? "bg-sky-700 text-white shadow-lg shadow-sky-200" : "cursor-not-allowed bg-slate-200 text-slate-400"}`}><Icon name="check" className="size-5" /> บันทึกการเปลี่ยนแปลง</Button>
+      </main>
+    </div>
+  );
+}
+
+function LineLoginPage({ connected, profileName, onBack, onConnected, onDisconnected }: { connected: boolean; profileName: string; onBack: () => void; onConnected: () => void; onDisconnected: () => void }) {
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [allowProfile, setAllowProfile] = useState(true);
+  const [allowNotifications, setAllowNotifications] = useState(true);
+
+  const connectLine = () => {
+    const channelId = import.meta.env.VITE_LINE_CHANNEL_ID;
+    const callbackUrl = import.meta.env.VITE_LINE_CALLBACK_URL;
+    if (channelId && callbackUrl) {
+      const state = crypto.randomUUID();
+      sessionStorage.setItem("keeply_line_oauth_state", state);
+      const authorizeUrl = new URL("https://access.line.me/oauth2/v2.1/authorize");
+      authorizeUrl.searchParams.set("response_type", "code");
+      authorizeUrl.searchParams.set("client_id", channelId);
+      authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
+      authorizeUrl.searchParams.set("state", state);
+      authorizeUrl.searchParams.set("scope", "profile openid email");
+      window.location.assign(authorizeUrl.toString());
+      return;
+    }
+    setIsConnecting(true);
+    window.setTimeout(() => {
+      setIsConnecting(false);
+      onConnected();
+    }, 900);
+  };
+
+  return (
+    <div className="min-h-screen pb-8">
+      <SecondaryHeader title="เชื่อมต่อ LINE Login" onBack={onBack} />
+      <main className="px-4 pt-5 sm:px-6">
+        <section className="rounded-3xl bg-gradient-to-br from-emerald-500 to-green-500 p-6 text-center text-white shadow-lg shadow-emerald-100">
+          <div className="mx-auto flex size-20 items-center justify-center rounded-3xl bg-white text-xl font-black tracking-tight text-emerald-500 shadow-lg">LINE</div>
+          <Heading level={1} className="mt-5 text-xl font-bold">{connected ? "เชื่อมต่อ LINE แล้ว" : "เข้าสู่ระบบด้วย LINE"}</Heading>
+          <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-white/80">{connected ? `บัญชี LINE เชื่อมกับโปรไฟล์ ${profileName} และพร้อมรับการแจ้งเตือน` : "เชื่อมบัญชีเพื่อเข้าสู่ Keeply ได้เร็วขึ้น และรับการแจ้งเตือนค่าใช้จ่ายผ่าน LINE"}</p>
+        </section>
+
+        {connected ? (
+          <>
+            <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+              <div className="flex items-center gap-3"><div className="flex size-12 items-center justify-center rounded-full bg-emerald-100 text-sm font-bold text-emerald-700">พ</div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">{profileName}</p><p className="mt-0.5 text-[10px] text-slate-400">LINE ID · เชื่อมต่อเมื่อวันนี้</p></div><span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[9px] font-semibold text-emerald-700">เชื่อมต่อแล้ว</span></div>
+            </section>
+            <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white">
+              <div className="flex items-center gap-3 border-b border-slate-100 p-4"><Icon name="shield" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">เข้าสู่ระบบอย่างปลอดภัย</p><p className="mt-0.5 text-[9px] text-slate-400">ใช้ LINE ยืนยันตัวตนแทนรหัสผ่าน</p></div></div>
+              <div className="flex items-center gap-3 p-4"><Icon name="bell" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">รับการแจ้งเตือนผ่าน LINE</p><p className="mt-0.5 text-[9px] text-slate-400">งบเกินกำหนด ค่างวด และรายการจากสมาชิก</p></div></div>
+            </section>
+            <Button onClick={onDisconnected} className="mt-5 w-full rounded-2xl border border-rose-200 bg-rose-50 py-3.5 text-sm font-semibold text-rose-600">ยกเลิกการเชื่อมต่อ LINE</Button>
+          </>
+        ) : (
+          <>
+            <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+              <Heading level={2} className="text-sm font-bold">ข้อมูลที่ Keeply ขอเข้าถึง</Heading>
+              <p className="mt-1 text-[10px] text-slate-400">คุณสามารถเปลี่ยนสิทธิ์การแจ้งเตือนได้ภายหลัง</p>
+              <div className="mt-4 space-y-3">
+                <LinePermission icon="user" title="โปรไฟล์พื้นฐาน" detail="ชื่อ รูปโปรไฟล์ และอีเมล" active={allowProfile} toggle={() => setAllowProfile(!allowProfile)} />
+                <LinePermission icon="bell" title="การแจ้งเตือนจาก Keeply" detail="แจ้งเตือนงบและรายการที่ใกล้ถึงกำหนด" active={allowNotifications} toggle={() => setAllowNotifications(!allowNotifications)} />
+              </div>
+            </section>
+            <section className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-4">
+              <div className="flex gap-3"><Icon name="shield" className="mt-0.5 size-5 shrink-0 text-sky-700" /><p className="text-[10px] leading-5 text-sky-700">Keeply จะไม่เห็นรหัสผ่าน LINE และจะใช้ข้อมูลตามสิทธิ์ที่คุณอนุญาตเท่านั้น คุณสามารถยกเลิกการเชื่อมต่อได้ทุกเมื่อ</p></div>
+            </section>
+            <Button onClick={allowProfile && !isConnecting ? connectLine : undefined} className={`mt-5 flex w-full items-center justify-center gap-3 rounded-2xl py-3.5 text-sm font-bold ${allowProfile ? "bg-emerald-500 text-white shadow-lg shadow-emerald-100" : "cursor-not-allowed bg-slate-200 text-slate-400"}`}>
+              <span className="flex size-6 items-center justify-center rounded-md bg-white text-[8px] font-black text-emerald-500">LINE</span>
+              {isConnecting ? "กำลังเชื่อมต่อ..." : "เข้าสู่ระบบด้วย LINE"}
+            </Button>
+            {!import.meta.env.VITE_LINE_CHANNEL_ID && <p className="mt-3 text-center text-[9px] leading-4 text-slate-400">ขณะนี้เป็นโหมดตัวอย่างสำหรับตรวจสอบหน้าจอ · การใช้งานจริงต้องกำหนด LINE Channel ID และ Callback URL</p>}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function LinePermission({ icon, title, detail, active, toggle }: { icon: IconName; title: string; detail: string; active: boolean; toggle: () => void }) {
+  return <div className="flex items-center gap-3 rounded-2xl bg-slate-50 p-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-slate-600"><Icon name={icon} className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-xs font-semibold">{title}</p><p className="mt-0.5 text-[9px] text-slate-400">{detail}</p></div><Button onClick={toggle} ariaLabel={title} className={`relative h-7 w-12 rounded-full transition ${active ? "bg-emerald-500" : "bg-slate-300"}`}><span className={`absolute top-1 size-5 rounded-full bg-white shadow transition ${active ? "left-6" : "left-1"}`} /></Button></div>;
+}
+
+function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openSettings, notify }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; lineConnected: boolean; onBack: () => void; openEdit: () => void; openLine: () => void; openSettings: () => void; notify: (message: string) => void }) {
   return (
     <div className="min-h-screen pb-8">
       <SecondaryHeader title="โปรไฟล์สมาชิก" onBack={onBack} action={<Button onClick={openSettings} ariaLabel="ตั้งค่า" className="flex size-10 items-center justify-center rounded-full bg-white text-slate-600 ring-1 ring-slate-200"><Icon name="settings" className="size-5" /></Button>} />
       <main className="px-4 pt-5 sm:px-6">
         <section className="rounded-3xl bg-gradient-to-br from-sky-700 to-sky-600 p-6 text-center text-white shadow-lg shadow-sky-200">
-          <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-sky-200 text-2xl font-bold text-sky-800 ring-4 ring-white/20">พ</div>
-          <Heading level={2} className="mt-4 text-xl font-bold">พีรพัฒน์</Heading>
+          <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-sky-200 text-2xl font-bold text-sky-800 ring-4 ring-white/20">{profile.name.charAt(0) || "พ"}</div>
+          <Heading level={2} className="mt-4 text-xl font-bold">{profile.name}</Heading>
           <p className="mt-1 text-xs text-sky-200">เจ้าของบ้าน · ผู้ดูแลระบบ</p>
-          <Button onClick={() => notify("พร้อมแก้ไขข้อมูลโปรไฟล์")} className="mt-5 rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold">แก้ไขโปรไฟล์</Button>
+          <Button onClick={openEdit} className="mt-5 rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold">แก้ไขโปรไฟล์</Button>
         </section>
         <div className="mt-4 grid grid-cols-3 gap-2">
           {[["8", "สิ่งของ"], ["6", "รายการที่เพิ่ม"], ["฿8,240", "มูลค่ารวม"]].map(([value, label]) => <div key={label} className="rounded-2xl border border-slate-200 bg-white p-3 text-center"><p className="text-base font-bold">{value}</p><p className="mt-1 text-[9px] text-slate-400">{label}</p></div>)}
         </div>
         <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white">
-          <ProfileRow icon="user" title="ข้อมูลส่วนตัว" detail="ชื่อ อีเมล และรูปโปรไฟล์" onClick={() => notify("เปิดข้อมูลส่วนตัว")} />
+          <ProfileRow icon="user" title="ข้อมูลส่วนตัว" detail={`${profile.email} · ${profile.phone}`} onClick={openEdit} />
+          <ProfileRow icon="user" title="LINE Login" detail={lineConnected ? "เชื่อมต่อแล้ว · รับการแจ้งเตือนผ่าน LINE" : "ยังไม่ได้เชื่อมต่อบัญชี LINE"} onClick={openLine} />
           <ProfileRow icon="shield" title="บทบาทในบ้าน" detail="เจ้าของบ้าน · จัดการได้ทั้งหมด" onClick={() => notify("เปิดรายละเอียดสิทธิ์")} />
           <ProfileRow icon="settings" title="การตั้งค่า" detail="การแจ้งเตือน ความเป็นส่วนตัว" onClick={openSettings} last />
         </section>
