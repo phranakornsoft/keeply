@@ -34,6 +34,10 @@ react(),
       host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
       strictPort: true,
+      // Keeply API (server/), e.g. the app container from docker-compose.yml.
+      proxy: {
+        '/api': process.env.KEEPLY_API_URL || 'http://localhost:3000',
+      },
       watch: {
         ignored: [
           '**/.figma/**',

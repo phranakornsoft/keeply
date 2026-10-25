@@ -1,4 +1,5 @@
-import { createElement, useState, type ChangeEvent, type ReactNode } from "react";
+import { createElement, useEffect, useState, type ChangeEvent, type ReactNode } from "react";
+import { ApiError, completeLineLogin, fetchAccount, isSignedIn, saveProfile, signOut, type Profile } from "./api";
 
 type Page = "home" | "items" | "lists" | "members" | "detail" | "add-item" | "add-list" | "profile" | "settings" | "year-plan" | "member-profile" | "notification-detail" | "add-quarter-plan" | "add-expense" | "subscriptions" | "edit-profile" | "line-login";
 type IconName =
@@ -73,6 +74,11 @@ const appNotifications = [
   { id: 4, icon: "calendar" as IconName, title: "มีการเพิ่มรายการใน Q3", detail: "พ่อเพิ่ม “เปลี่ยนโทรศัพท์” งบประมาณ ฿8,000", time: "27 พ.ค. · 14:12", tone: "bg-sky-100 text-sky-700", type: "Year Plan", badge: "bg-sky-100 text-sky-700", opensPlan: true },
 ];
 
+const demoProfile: Profile = { name: "พีรพัฒน์", email: "peeraphat@keeply.family", phone: "081-234-5678", birthday: "1992-08-18", bio: "ดูแลของใช้และแผนค่าใช้จ่ายของบ้าน" };
+
+// LINE returns to the app's root on whichever origin it runs on; each origin must be registered as a callback URL in the LINE channel.
+const lineCallbackUrl = () => new URL(import.meta.env.BASE_URL, window.location.origin).href;
+
 export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [previousPage, setPreviousPage] = useState<Page>("items");
@@ -85,13 +91,96 @@ export default function App() {
   const [selectedNotificationId, setSelectedNotificationId] = useState(1);
   const [selectedMember, setSelectedMember] = useState("แม่");
   const [selectedQuarter, setSelectedQuarter] = useState("Q2");
-  const [profile, setProfile] = useState({ name: "พีรพัฒน์", email: "peeraphat@keeply.family", phone: "081-234-5678", birthday: "1992-08-18", bio: "ดูแลของใช้และแผนค่าใช้จ่ายของบ้าน" });
+  const [profile, setProfile] = useState<Profile>(demoProfile);
   const [lineConnected, setLineConnected] = useState(false);
+  const [signedIn, setSignedIn] = useState(isSignedIn);
 
   const notify = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(""), 2300);
   };
+
+  const endSession = (message: string) => {
+    if (signedIn) {
+      setProfile(demoProfile);
+      setSignedIn(false);
+      signOut();
+    }
+    setLineConnected(false);
+    notify(message);
+    setPage("profile");
+  };
+
+  const updateProfile = (value: Profile) => {
+    if (!signedIn) {
+      setProfile(value);
+      notify("บันทึกโปรไฟล์เรียบร้อยแล้ว");
+      setPage("profile");
+      return;
+    }
+    saveProfile(value)
+      .then((saved) => {
+        setProfile(saved);
+        notify("บันทึกโปรไฟล์เรียบร้อยแล้ว");
+        setPage("profile");
+      })
+      .catch((error) => {
+        if (error instanceof ApiError && error.status === 401) {
+          endSession("เซสชันหมดอายุ กรุณาเข้าสู่ระบบด้วย LINE อีกครั้ง");
+          return;
+        }
+        console.error("Saving profile failed:", error);
+        notify("บันทึกโปรไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+      });
+  };
+
+  // On load, either finish the LINE redirect (?code&state or ?error&state after connectLine()) or restore a saved session.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const state = params.get("state");
+    const code = params.get("code");
+    if (!state || (!code && !params.get("error"))) {
+      if (!isSignedIn()) return;
+      fetchAccount()
+        .then((account) => {
+          setProfile(account.profile);
+          setLineConnected(true);
+        })
+        .catch((error) => {
+          // On 401 the server has already cleared the expired session's cookies.
+          if (error instanceof ApiError && error.status === 401) setSignedIn(false);
+          else console.error("Restoring session failed:", error);
+        });
+      return;
+    }
+
+    const expectedState = sessionStorage.getItem("keeply_line_oauth_state");
+    const nonce = sessionStorage.getItem("keeply_line_oauth_nonce");
+    sessionStorage.removeItem("keeply_line_oauth_state");
+    sessionStorage.removeItem("keeply_line_oauth_nonce");
+    window.history.replaceState(null, "", window.location.pathname);
+    setPage("profile");
+
+    if (state !== expectedState) {
+      notify("เชื่อมต่อ LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+      return;
+    }
+    if (!code) {
+      notify("ยกเลิกการเชื่อมต่อ LINE แล้ว");
+      return;
+    }
+    completeLineLogin(code, nonce, lineCallbackUrl())
+      .then((account) => {
+        setProfile(account.profile);
+        setLineConnected(true);
+        setSignedIn(true);
+        notify(`เชื่อมต่อบัญชี LINE ${account.line.name} เรียบร้อยแล้ว`);
+      })
+      .catch((error) => {
+        console.error("LINE login failed:", error);
+        notify("เชื่อมต่อ LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+      });
+  }, []);
 
   const openDetail = () => {
     setPreviousPage(page);
@@ -109,11 +198,11 @@ export default function App() {
         ) : page === "add-list" ? (
           <AddSharedListPage onBack={() => setPage("lists")} onSave={() => { notify("เพิ่มรายการร่วมกันเรียบร้อยแล้ว"); setPage("lists"); }} />
         ) : page === "profile" ? (
-          <ProfilePage profile={profile} lineConnected={lineConnected} onBack={() => setPage("members")} openEdit={() => setPage("edit-profile")} openLine={() => setPage("line-login")} openSettings={() => setPage("settings")} notify={notify} />
+          <ProfilePage profile={profile} lineConnected={lineConnected} onBack={() => setPage("members")} openEdit={() => setPage("edit-profile")} openLine={() => setPage("line-login")} openSettings={() => setPage("settings")} onSignOut={() => (signedIn ? endSession("ออกจากระบบแล้ว") : notify("ยังไม่ได้ออกจากระบบในตัวอย่างนี้"))} notify={notify} />
         ) : page === "edit-profile" ? (
-          <EditProfilePage profile={profile} onBack={() => setPage("profile")} onSave={(value) => { setProfile(value); notify("บันทึกโปรไฟล์เรียบร้อยแล้ว"); setPage("profile"); }} />
+          <EditProfilePage profile={profile} onBack={() => setPage("profile")} onSave={updateProfile} />
         ) : page === "line-login" ? (
-          <LineLoginPage connected={lineConnected} profileName={profile.name} onBack={() => setPage("profile")} onConnected={() => { setLineConnected(true); notify("เชื่อมต่อบัญชี LINE เรียบร้อยแล้ว"); setPage("profile"); }} onDisconnected={() => { setLineConnected(false); notify("ยกเลิกการเชื่อมต่อ LINE แล้ว"); setPage("profile"); }} />
+          <LineLoginPage connected={lineConnected} profileName={profile.name} onBack={() => setPage("profile")} onConnected={() => { setLineConnected(true); notify("เชื่อมต่อบัญชี LINE เรียบร้อยแล้ว"); setPage("profile"); }} onDisconnected={() => endSession("ยกเลิกการเชื่อมต่อ LINE แล้ว")} />
         ) : page === "settings" ? (
           <SettingsPage onBack={() => setPage("profile")} notify={notify} />
         ) : page === "year-plan" ? (
@@ -923,16 +1012,18 @@ function LineLoginPage({ connected, profileName, onBack, onConnected, onDisconne
 
   const connectLine = () => {
     const channelId = import.meta.env.VITE_LINE_CHANNEL_ID;
-    const callbackUrl = import.meta.env.VITE_LINE_CALLBACK_URL;
-    if (channelId && callbackUrl) {
+    if (channelId) {
       const state = crypto.randomUUID();
+      const nonce = crypto.randomUUID();
       sessionStorage.setItem("keeply_line_oauth_state", state);
+      sessionStorage.setItem("keeply_line_oauth_nonce", nonce);
       const authorizeUrl = new URL("https://access.line.me/oauth2/v2.1/authorize");
       authorizeUrl.searchParams.set("response_type", "code");
       authorizeUrl.searchParams.set("client_id", channelId);
-      authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
+      authorizeUrl.searchParams.set("redirect_uri", lineCallbackUrl());
       authorizeUrl.searchParams.set("state", state);
       authorizeUrl.searchParams.set("scope", "profile openid email");
+      authorizeUrl.searchParams.set("nonce", nonce);
       window.location.assign(authorizeUrl.toString());
       return;
     }
@@ -981,7 +1072,7 @@ function LineLoginPage({ connected, profileName, onBack, onConnected, onDisconne
               <span className="flex size-6 items-center justify-center rounded-md bg-white text-[8px] font-black text-emerald-500">LINE</span>
               {isConnecting ? "กำลังเชื่อมต่อ..." : "เข้าสู่ระบบด้วย LINE"}
             </Button>
-            {!import.meta.env.VITE_LINE_CHANNEL_ID && <p className="mt-3 text-center text-[9px] leading-4 text-slate-400">ขณะนี้เป็นโหมดตัวอย่างสำหรับตรวจสอบหน้าจอ · การใช้งานจริงต้องกำหนด LINE Channel ID และ Callback URL</p>}
+            {!import.meta.env.VITE_LINE_CHANNEL_ID && <p className="mt-3 text-center text-[9px] leading-4 text-slate-400">ขณะนี้เป็นโหมดตัวอย่างสำหรับตรวจสอบหน้าจอ · การใช้งานจริงต้องกำหนด LINE Channel ID</p>}
           </>
         )}
       </main>
@@ -993,7 +1084,7 @@ function LinePermission({ icon, title, detail, active, toggle }: { icon: IconNam
   return <div className="flex items-center gap-3 rounded-2xl bg-slate-50 p-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-slate-600"><Icon name={icon} className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-xs font-semibold">{title}</p><p className="mt-0.5 text-[9px] text-slate-400">{detail}</p></div><Button onClick={toggle} ariaLabel={title} className={`relative h-7 w-12 rounded-full transition ${active ? "bg-emerald-500" : "bg-slate-300"}`}><span className={`absolute top-1 size-5 rounded-full bg-white shadow transition ${active ? "left-6" : "left-1"}`} /></Button></div>;
 }
 
-function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openSettings, notify }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; lineConnected: boolean; onBack: () => void; openEdit: () => void; openLine: () => void; openSettings: () => void; notify: (message: string) => void }) {
+function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openSettings, onSignOut, notify }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; lineConnected: boolean; onBack: () => void; openEdit: () => void; openLine: () => void; openSettings: () => void; onSignOut: () => void; notify: (message: string) => void }) {
   return (
     <div className="min-h-screen pb-8">
       <SecondaryHeader title="โปรไฟล์สมาชิก" onBack={onBack} action={<Button onClick={openSettings} ariaLabel="ตั้งค่า" className="flex size-10 items-center justify-center rounded-full bg-white text-slate-600 ring-1 ring-slate-200"><Icon name="settings" className="size-5" /></Button>} />
@@ -1013,7 +1104,7 @@ function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openS
           <ProfileRow icon="shield" title="บทบาทในบ้าน" detail="เจ้าของบ้าน · จัดการได้ทั้งหมด" onClick={() => notify("เปิดรายละเอียดสิทธิ์")} />
           <ProfileRow icon="settings" title="การตั้งค่า" detail="การแจ้งเตือน ความเป็นส่วนตัว" onClick={openSettings} last />
         </section>
-        <Button onClick={() => notify("ยังไม่ได้ออกจากระบบในตัวอย่างนี้")} className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 py-3 text-sm font-semibold text-rose-600"><Icon name="logout" className="size-5" /> ออกจากระบบ</Button>
+        <Button onClick={onSignOut} className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 py-3 text-sm font-semibold text-rose-600"><Icon name="logout" className="size-5" /> ออกจากระบบ</Button>
       </main>
     </div>
   );
