@@ -19,6 +19,7 @@ const SIGNED_IN_COOKIE = "keeply_signed_in";
 const cookieOptions = { path: "/", secure, sameSite: "Lax" } as const;
 
 type Profile = db.Profile;
+type Goals = db.Goals;
 
 const text = (value: unknown, max: number) => (typeof value === "string" ? value.trim().slice(0, max) : "");
 
@@ -36,6 +37,22 @@ function cleanProfile(input: Record<string, unknown>): Profile {
     bio: text(input.bio, 80),
   };
 }
+
+// Whole baht, as typed into the goals form.
+const baht = (value: unknown) => (Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= 99_999_999 ? (value as number) : 0);
+
+// Null unless every goal is set: a name, both budgets and one of the usage periods the app offers.
+function cleanGoals(input: Record<string, unknown>): Goals | null {
+  const goals = {
+    name: text(input.name, 50),
+    annualBudget: baht(input.annualBudget),
+    monthlyBudget: baht(input.monthlyBudget),
+    usageYears: [1, 2, 3, 5].includes(input.usageYears as number) ? (input.usageYears as number) : 0,
+  };
+  return goals.name && goals.annualBudget && goals.monthlyBudget && goals.usageYears ? goals : null;
+}
+
+const inviteRoles: db.InviteRole[] = ["editor", "viewer"];
 
 const readJson = (c: Context): Promise<Record<string, unknown>> => c.req.json().catch(() => ({}));
 
@@ -57,6 +74,17 @@ async function sessionUser(c: Context) {
   if (!userId) clearSessionCookies(c);
   return userId;
 }
+
+// The household the signed-in user owns, or the error response to send instead.
+async function ownedHousehold(c: Context) {
+  const userId = await sessionUser(c);
+  if (!userId) return { error: c.json({ error: "Not signed in" }, 401) };
+  const membership = await db.findMembership(userId);
+  if (membership?.role !== "owner") return { error: c.json({ error: "Only the household owner can do this" }, 403) };
+  return { userId, householdId: membership.householdId };
+}
+
+const expiredInvite = { error: "This invite link has expired or has been used" };
 
 const app = new Hono();
 
@@ -138,7 +166,7 @@ app.post("/api/line/callback", async (c) => {
   return c.json(await db.readAccount(userId));
 });
 
-// Restore the signed-in user's LINE link and profile when the app loads.
+// Restore the signed-in user's LINE link, profile and household when the app loads.
 app.get("/api/me", async (c) => {
   const userId = await sessionUser(c);
   if (!userId) return c.json({ error: "Not signed in" }, 401);
@@ -154,6 +182,76 @@ app.put("/api/profile", async (c) => {
   }
   await db.saveProfile(userId, profile);
   return c.json({ profile });
+});
+
+// First sign-in: set up the user's household from the goals form, with the user as its owner.
+app.post("/api/household", async (c) => {
+  const userId = await sessionUser(c);
+  if (!userId) return c.json({ error: "Not signed in" }, 401);
+  const goals = cleanGoals(await readJson(c));
+  if (!goals) return c.json({ error: "name, annualBudget, monthlyBudget and usageYears are required" }, 400);
+  try {
+    await db.createHousehold(userId, goals);
+  } catch (error) {
+    if (db.isDuplicateKey(error)) return c.json({ error: "Already a member of a household" }, 409);
+    throw error;
+  }
+  return c.json({ household: await db.readHousehold(userId) });
+});
+
+app.put("/api/household", async (c) => {
+  const owner = await ownedHousehold(c);
+  if ("error" in owner) return owner.error;
+  const goals = cleanGoals(await readJson(c));
+  if (!goals) return c.json({ error: "name, annualBudget, monthlyBudget and usageYears are required" }, 400);
+  await db.saveGoals(owner.householdId, goals);
+  return c.json({ household: await db.readHousehold(owner.userId) });
+});
+
+// Create a single-use invite link. Only this response carries the token; the database keeps its hash.
+app.post("/api/household/invites", async (c) => {
+  const owner = await ownedHousehold(c);
+  if ("error" in owner) return owner.error;
+  const input = await readJson(c);
+  const role = inviteRoles.find((item) => item === input.role);
+  if (!role) return c.json({ error: "role must be editor or viewer" }, 400);
+  const token = await db.createInvite(owner.householdId, owner.userId, text(input.name, 50), role);
+  return c.json({ token, household: await db.readHousehold(owner.userId) });
+});
+
+app.delete("/api/household/invites/:id{[0-9]+}", async (c) => {
+  const owner = await ownedHousehold(c);
+  if ("error" in owner) return owner.error;
+  await db.deleteInvite(owner.householdId, Number(c.req.param("id")));
+  return c.json({ household: await db.readHousehold(owner.userId) });
+});
+
+// Who is inviting to which household, for the sign-in screen. Holding the link is what grants access, so no session is needed.
+app.get("/api/invites/:token", async (c) => {
+  const invite = await db.findInvite(c.req.param("token"));
+  if (!invite) return c.json(expiredInvite, 404);
+  return c.json({ householdName: invite.householdName, invitedBy: invite.invitedBy, role: invite.role });
+});
+
+app.post("/api/invites/:token/accept", async (c) => {
+  const userId = await sessionUser(c);
+  if (!userId) return c.json({ error: "Not signed in" }, 401);
+  const token = c.req.param("token");
+  const invite = await db.findInvite(token);
+  if (!invite) return c.json(expiredInvite, 404);
+  const membership = await db.findMembership(userId);
+  if (membership) {
+    // Opening a link to your own household (the owner trying it out, say) leaves it for the person it was made for.
+    if (membership.householdId === invite.householdId) return c.json({ household: await db.readHousehold(userId) });
+    return c.json({ error: "Already a member of another household" }, 409);
+  }
+  try {
+    if (!(await db.acceptInvite(userId, token))) return c.json(expiredInvite, 404);
+  } catch (error) {
+    if (db.isDuplicateKey(error)) return c.json({ error: "Already a member of another household" }, 409);
+    throw error;
+  }
+  return c.json({ household: await db.readHousehold(userId) });
 });
 
 app.post("/api/logout", async (c) => {
@@ -175,6 +273,8 @@ app.use(
     },
   }),
 );
+
+await db.migrate();
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
   console.log(`Keeply listening on port ${info.port} for ${APP_ORIGIN}`);

@@ -25,6 +25,7 @@ WORKDIR /app
 COPY --from=server /server/node_modules ./node_modules
 COPY --from=server /server/package.json ./
 COPY --from=server /server/src ./src
+COPY server/migrations ./migrations
 COPY --from=web /web/dist ./public
 USER node
 EXPOSE 3000

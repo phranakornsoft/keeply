@@ -1,5 +1,5 @@
--- Keeply schema for MariaDB 10.6+ or MySQL 8+.
--- The db service in docker-compose.yml runs this once, when its data volume is first created.
+-- Keeply schema for MariaDB 10.6+ or MySQL 8+. The server applies the files in this folder in name order on startup.
+-- IF NOT EXISTS lets this first file run on databases that were created from it before migrations existed.
 
 CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,

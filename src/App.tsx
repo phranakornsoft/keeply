@@ -1,7 +1,11 @@
 import { createElement, useEffect, useState, type ChangeEvent, type ReactNode } from "react";
-import { ApiError, completeLineLogin, fetchAccount, isSignedIn, saveProfile, signOut, type Profile } from "./api";
+import {
+  acceptInvite, ApiError, completeLineLogin, createHousehold, createInvite, deleteInvite, fetchAccount, fetchInvite, isSignedIn, saveGoals, saveProfile, signOut,
+  type Account, type Goals, type Household, type InvitePreview, type InviteRole, type Member, type Profile, type Role,
+} from "./api";
 
-type Page = "home" | "items" | "lists" | "members" | "detail" | "add-item" | "add-list" | "profile" | "settings" | "year-plan" | "member-profile" | "notification-detail" | "add-quarter-plan" | "add-expense" | "subscriptions" | "edit-profile" | "line-login";
+type Page = "home" | "items" | "lists" | "members" | "detail" | "add-item" | "add-list" | "profile" | "settings" | "year-plan" | "member-profile" | "notification-detail" | "add-quarter-plan" | "add-expense" | "subscriptions" | "edit-profile" | "line-login" | "household-goals" | "setup-invite" | "invite-members";
+type Session = "loading" | "signed-out" | "signed-in";
 type IconName =
   | "home" | "box" | "list" | "users" | "bell" | "chevron" | "plus"
   | "phone" | "chair" | "coffee" | "check" | "clock" | "cart" | "card"
@@ -76,8 +80,55 @@ const appNotifications = [
 
 const demoProfile: Profile = { name: "พีรพัฒน์", email: "peeraphat@keeply.family", phone: "081-234-5678", birthday: "1992-08-18", bio: "ดูแลของใช้และแผนค่าใช้จ่ายของบ้าน" };
 
+// Without a LINE channel ID (the Figma Make preview, say) sign-in, setup and invites are simulated and nothing is saved.
+const demoMode = !import.meta.env.VITE_LINE_CHANNEL_ID;
+const inviteStorageKey = "keeply_invite";
+const usagePeriods = [1, 2, 3, 5];
+const roleLabels: Record<Role, string> = { owner: "เจ้าของบ้าน", editor: "เพิ่มและแก้ไขได้", viewer: "ดูอย่างเดียว" };
+const roleTones: Record<Role, string> = { owner: "bg-sky-200 text-sky-800", editor: "bg-amber-200 text-amber-800", viewer: "bg-emerald-200 text-emerald-800" };
+// Spending isn't recorded yet, so the Year Plan still shows this sample figure against the household's real budget.
+const sampleSpent = 18240;
+
+const baht = (amount: number) => `฿${amount.toLocaleString()}`;
+// The letter shown in an avatar. Thai vowels written before their consonant are skipped, so แม่ shows ม rather than แ.
+const initial = (name: string) => name.trim().replace(/^[เแโใไ]/, "").charAt(0) || "?";
+const thaiDate = (iso: string) => new Date(iso).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "numeric" });
+const spentPercent = (annualBudget: number) => Math.min(100, Math.round((sampleSpent / annualBudget) * 100));
+
 // LINE returns to the app's root on whichever origin it runs on; each origin must be registered as a callback URL in the LINE channel.
 const lineCallbackUrl = () => new URL(import.meta.env.BASE_URL, window.location.origin).href;
+const inviteUrl = (token: string) => `${lineCallbackUrl()}?invite=${token}`;
+
+// LINE sends the browser back with ?code&state, or ?error&state when the user cancels.
+function lineRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("state") && (params.get("code") || params.get("error")) ? params : null;
+}
+
+function startLineLogin() {
+  const state = crypto.randomUUID();
+  const nonce = crypto.randomUUID();
+  sessionStorage.setItem("keeply_line_oauth_state", state);
+  sessionStorage.setItem("keeply_line_oauth_nonce", nonce);
+  const authorizeUrl = new URL("https://access.line.me/oauth2/v2.1/authorize");
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("client_id", import.meta.env.VITE_LINE_CHANNEL_ID);
+  authorizeUrl.searchParams.set("redirect_uri", lineCallbackUrl());
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("scope", "profile openid email");
+  authorizeUrl.searchParams.set("nonce", nonce);
+  window.location.assign(authorizeUrl.toString());
+}
+
+const demoHousehold = (goals: Goals, profile: Profile): Household => ({
+  ...goals,
+  role: "owner",
+  members: [{ id: 0, name: profile.name, picture: null, role: "owner", joinedAt: new Date().toISOString(), you: true }],
+  invites: [],
+});
+
+// The start-up effect must run once per page load, even under StrictMode, because LINE codes and invite links are single-use.
+let booted = false;
 
 export default function App() {
   const [page, setPage] = useState<Page>("home");
@@ -89,67 +140,155 @@ export default function App() {
   const [showNotifications, setShowNotifications] = useState(false);
   const [readNotifications, setReadNotifications] = useState<number[]>([3, 4]);
   const [selectedNotificationId, setSelectedNotificationId] = useState(1);
-  const [selectedMember, setSelectedMember] = useState("แม่");
+  const [selectedMember, setSelectedMember] = useState<Member | null>(null);
   const [selectedQuarter, setSelectedQuarter] = useState("Q2");
   const [profile, setProfile] = useState<Profile>(demoProfile);
-  const [lineConnected, setLineConnected] = useState(false);
-  const [signedIn, setSignedIn] = useState(isSignedIn);
+  const [session, setSession] = useState<Session>(() => (lineRedirect() || isSignedIn() ? "loading" : "signed-out"));
+  const [household, setHousehold] = useState<Household | null>(null);
+  const [invite, setInvite] = useState<InvitePreview | null>(null);
 
   const notify = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(""), 2300);
   };
 
+  // Back to the sign-in screen, after signing out or when the server no longer accepts the session.
   const endSession = (message: string) => {
-    if (signedIn) {
-      setProfile(demoProfile);
-      setSignedIn(false);
-      signOut();
-    }
-    setLineConnected(false);
+    if (!demoMode) signOut();
+    setSession("signed-out");
+    setHousehold(null);
+    setProfile(demoProfile);
+    setPage("home");
     notify(message);
-    setPage("profile");
   };
 
-  const updateProfile = (value: Profile) => {
-    if (!signedIn) {
-      setProfile(value);
-      notify("บันทึกโปรไฟล์เรียบร้อยแล้ว");
-      setPage("profile");
+  const failed = (error: unknown, message: string) => {
+    if (error instanceof ApiError && error.status === 401) {
+      endSession("เซสชันหมดอายุ กรุณาเข้าสู่ระบบด้วย LINE อีกครั้ง");
       return;
     }
-    saveProfile(value)
-      .then((saved) => {
-        setProfile(saved);
-        notify("บันทึกโปรไฟล์เรียบร้อยแล้ว");
-        setPage("profile");
-      })
-      .catch((error) => {
-        if (error instanceof ApiError && error.status === 401) {
-          endSession("เซสชันหมดอายุ กรุณาเข้าสู่ระบบด้วย LINE อีกครั้ง");
-          return;
-        }
-        console.error("Saving profile failed:", error);
-        notify("บันทึกโปรไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+    console.error(message, error);
+    notify(message);
+  };
+
+  // The sign-in screen, introduced by whoever invited this browser if it arrived through an invite link.
+  const showSignIn = () => {
+    setSession("signed-out");
+    const token = sessionStorage.getItem(inviteStorageKey);
+    if (!token) return;
+    fetchInvite(token)
+      .then(setInvite)
+      .catch(() => {
+        sessionStorage.removeItem(inviteStorageKey);
+        notify("ลิงก์เชิญหมดอายุหรือถูกใช้ไปแล้ว");
       });
   };
 
-  // On load, either finish the LINE redirect (?code&state or ?error&state after connectLine()) or restore a saved session.
+  // Signed in: join the household from a pending invite link if there is one, then show household setup or the app.
+  const enter = async (account: Account, welcome?: string) => {
+    let joined = account.household;
+    let message = welcome;
+    const token = sessionStorage.getItem(inviteStorageKey);
+    sessionStorage.removeItem(inviteStorageKey);
+    if (token) {
+      try {
+        joined = await acceptInvite(token);
+        message = account.household ? `คุณเป็นสมาชิก ${joined.name} อยู่แล้ว` : `เข้าร่วม ${joined.name} เรียบร้อยแล้ว`;
+      } catch (error) {
+        message = error instanceof ApiError && error.status === 409 ? "บัญชี LINE นี้เป็นสมาชิกบ้านอื่นอยู่แล้ว" : "ลิงก์เชิญหมดอายุหรือถูกใช้ไปแล้ว";
+      }
+    }
+    setProfile(account.profile);
+    setHousehold(joined);
+    setInvite(null);
+    setSession("signed-in");
+    if (message) notify(message);
+  };
+
+  const updateProfile = (value: Profile) => {
+    const saved = (result: Profile) => {
+      setProfile(result);
+      notify("บันทึกโปรไฟล์เรียบร้อยแล้ว");
+      setPage("profile");
+    };
+    if (demoMode) return saved(value);
+    saveProfile(value).then(saved).catch((error) => failed(error, "บันทึกโปรไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"));
+  };
+
+  // First sign-in, step 1 of 2: save the household's goals, then go on to inviting members.
+  const setUpHousehold = (goals: Goals) => {
+    const created = (result: Household) => {
+      setHousehold(result);
+      setPage("setup-invite");
+      window.scrollTo({ top: 0 });
+    };
+    if (demoMode) return created(demoHousehold(goals, profile));
+    return createHousehold(goals).then(created).catch((error) => failed(error, "บันทึกเป้าหมายไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"));
+  };
+
+  const updateGoals = (goals: Goals) => {
+    const saved = (result: Household) => {
+      setHousehold(result);
+      notify("บันทึกเป้าหมายของบ้านแล้ว");
+      setPage("settings");
+    };
+    if (demoMode) {
+      if (household) saved({ ...household, ...goals });
+      return;
+    }
+    return saveGoals(goals).then(saved).catch((error) => failed(error, "บันทึกเป้าหมายไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"));
+  };
+
+  // Resolves to the link to send, or null if it couldn't be created.
+  const inviteMember = (name: string, role: InviteRole): Promise<string | null> => {
+    if (demoMode) {
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      setHousehold((current) => current && { ...current, invites: [...current.invites, { id: Date.now(), name, role, expiresAt }] });
+      return Promise.resolve(inviteUrl("demo"));
+    }
+    return createInvite(name, role)
+      .then((result) => {
+        setHousehold(result.household);
+        return inviteUrl(result.token);
+      })
+      .catch((error) => {
+        failed(error, "สร้างลิงก์เชิญไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+        return null;
+      });
+  };
+
+  const revokeInvite = (id: number) => {
+    const revoked = (result: Household) => {
+      setHousehold(result);
+      notify("ยกเลิกลิงก์เชิญแล้ว");
+    };
+    if (demoMode) {
+      if (household) revoked({ ...household, invites: household.invites.filter((item) => item.id !== id) });
+      return;
+    }
+    deleteInvite(id).then(revoked).catch((error) => failed(error, "ยกเลิกลิงก์เชิญไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"));
+  };
+
+  // On load, keep an invite link for after sign-in, then finish the LINE redirect from startLineLogin() or restore a saved session.
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const state = params.get("state");
-    const code = params.get("code");
-    if (!state || (!code && !params.get("error"))) {
-      if (!isSignedIn()) return;
+    if (booted) return;
+    booted = true;
+    const redirect = lineRedirect();
+    const inviteToken = new URLSearchParams(window.location.search).get("invite");
+    if (inviteToken && !demoMode) sessionStorage.setItem(inviteStorageKey, inviteToken);
+    if (inviteToken || redirect) window.history.replaceState(null, "", window.location.pathname);
+
+    if (!redirect) {
+      if (!isSignedIn()) {
+        showSignIn();
+        return;
+      }
       fetchAccount()
-        .then((account) => {
-          setProfile(account.profile);
-          setLineConnected(true);
-        })
+        .then((account) => enter(account))
         .catch((error) => {
           // On 401 the server has already cleared the expired session's cookies.
-          if (error instanceof ApiError && error.status === 401) setSignedIn(false);
-          else console.error("Restoring session failed:", error);
+          if (!(error instanceof ApiError && error.status === 401)) console.error("Restoring session failed:", error);
+          showSignIn();
         });
       return;
     }
@@ -158,29 +297,28 @@ export default function App() {
     const nonce = sessionStorage.getItem("keeply_line_oauth_nonce");
     sessionStorage.removeItem("keeply_line_oauth_state");
     sessionStorage.removeItem("keeply_line_oauth_nonce");
-    window.history.replaceState(null, "", window.location.pathname);
-    setPage("profile");
-
-    if (state !== expectedState) {
-      notify("เชื่อมต่อ LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
-      return;
-    }
-    if (!code) {
-      notify("ยกเลิกการเชื่อมต่อ LINE แล้ว");
+    const code = redirect.get("code");
+    if (redirect.get("state") !== expectedState || !code) {
+      showSignIn();
+      notify(code ? "เข้าสู่ระบบด้วย LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "ยกเลิกการเข้าสู่ระบบด้วย LINE แล้ว");
       return;
     }
     completeLineLogin(code, nonce, lineCallbackUrl())
-      .then((account) => {
-        setProfile(account.profile);
-        setLineConnected(true);
-        setSignedIn(true);
-        notify(`เชื่อมต่อบัญชี LINE ${account.line.name} เรียบร้อยแล้ว`);
-      })
+      .then((account) => enter(account, `ยินดีต้อนรับ ${account.line.name}`))
       .catch((error) => {
         console.error("LINE login failed:", error);
-        notify("เชื่อมต่อ LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+        showSignIn();
+        notify("เข้าสู่ระบบด้วย LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
       });
   }, []);
+
+  // Pick up members who joined since the app loaded.
+  useEffect(() => {
+    if (page !== "members" || session !== "signed-in" || demoMode) return;
+    fetchAccount()
+      .then((account) => setHousehold(account.household))
+      .catch((error) => failed(error, "โหลดรายชื่อสมาชิกไม่สำเร็จ"));
+  }, [page]);
 
   const openDetail = () => {
     setPreviousPage(page);
@@ -191,30 +329,50 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800">
       <div className="mx-auto min-h-screen max-w-3xl bg-slate-50 shadow-sm">
-        {page === "detail" ? (
+        {session === "loading" ? (
+          <LoadingScreen />
+        ) : session === "signed-out" ? (
+          <SignInPage invite={invite} onSignIn={demoMode ? () => setSession("signed-in") : startLineLogin} />
+        ) : !household ? (
+          <HouseholdGoalsPage initial={{ name: `ครอบครัว${profile.name.trim().split(/\s+/)[0]}`, annualBudget: 0, monthlyBudget: 0, usageYears: 2 }} onboarding onSave={setUpHousehold} onSignOut={() => endSession("ออกจากระบบแล้ว")} />
+        ) : page === "setup-invite" || page === "invite-members" ? (
+          <InviteMembersPage
+            household={household}
+            inviterName={profile.name}
+            onboarding={page === "setup-invite"}
+            onBack={() => setPage("members")}
+            onCreate={inviteMember}
+            onRevoke={revokeInvite}
+            onDone={() => { notify(`${household.name} พร้อมใช้งานแล้ว`); setPage("home"); }}
+            notify={notify}
+          />
+        ) : page === "household-goals" ? (
+          <HouseholdGoalsPage initial={household} onBack={() => setPage("settings")} onSave={updateGoals} />
+        ) : page === "detail" ? (
           <ProductDetail onBack={() => setPage(previousPage === "detail" ? "items" : previousPage)} notify={notify} />
         ) : page === "add-item" ? (
-          <AddItemPage onBack={() => setPage("items")} onSave={() => { notify("เพิ่มสิ่งของใหม่เรียบร้อยแล้ว"); setPage("items"); }} />
+          <AddItemPage usageYears={household.usageYears} onBack={() => setPage("items")} onSave={() => { notify("เพิ่มสิ่งของใหม่เรียบร้อยแล้ว"); setPage("items"); }} />
         ) : page === "add-list" ? (
           <AddSharedListPage onBack={() => setPage("lists")} onSave={() => { notify("เพิ่มรายการร่วมกันเรียบร้อยแล้ว"); setPage("lists"); }} />
         ) : page === "profile" ? (
-          <ProfilePage profile={profile} lineConnected={lineConnected} onBack={() => setPage("members")} openEdit={() => setPage("edit-profile")} openLine={() => setPage("line-login")} openSettings={() => setPage("settings")} onSignOut={() => (signedIn ? endSession("ออกจากระบบแล้ว") : notify("ยังไม่ได้ออกจากระบบในตัวอย่างนี้"))} notify={notify} />
+          <ProfilePage profile={profile} household={household} onBack={() => setPage("members")} openEdit={() => setPage("edit-profile")} openLine={() => setPage("line-login")} openSettings={() => setPage("settings")} onSignOut={() => endSession("ออกจากระบบแล้ว")} notify={notify} />
         ) : page === "edit-profile" ? (
           <EditProfilePage profile={profile} onBack={() => setPage("profile")} onSave={updateProfile} />
         ) : page === "line-login" ? (
-          <LineLoginPage connected={lineConnected} profileName={profile.name} onBack={() => setPage("profile")} onConnected={() => { setLineConnected(true); notify("เชื่อมต่อบัญชี LINE เรียบร้อยแล้ว"); setPage("profile"); }} onDisconnected={() => endSession("ยกเลิกการเชื่อมต่อ LINE แล้ว")} />
+          <LineLoginPage profileName={profile.name} onBack={() => setPage("profile")} onDisconnected={() => endSession("ยกเลิกการเชื่อมต่อ LINE แล้ว")} />
         ) : page === "settings" ? (
-          <SettingsPage onBack={() => setPage("profile")} notify={notify} />
+          <SettingsPage household={household} onBack={() => setPage("profile")} openGoals={() => setPage("household-goals")} openMembers={() => setPage("members")} notify={notify} />
         ) : page === "year-plan" ? (
           <YearPlanPage
+            annualBudget={household.annualBudget}
             onBack={() => setPage("home")}
             notify={notify}
             addPlan={(quarter) => { setSelectedQuarter(quarter); setPage("add-quarter-plan"); }}
             addExpense={() => setPage("add-expense")}
             openSubscriptions={() => setPage("subscriptions")}
           />
-        ) : page === "member-profile" ? (
-          <MemberProfilePage memberName={selectedMember} onBack={() => setPage("members")} notify={notify} />
+        ) : page === "member-profile" && selectedMember ? (
+          <MemberProfilePage member={selectedMember} onBack={() => setPage("members")} notify={notify} />
         ) : page === "notification-detail" ? (
           <NotificationDetailPage notificationId={selectedNotificationId} onBack={() => setPage("home")} openYearPlan={() => setPage("year-plan")} />
         ) : page === "add-quarter-plan" ? (
@@ -225,12 +383,12 @@ export default function App() {
           <SubscriptionsPage onBack={() => setPage("year-plan")} notify={notify} />
         ) : (
           <>
-            <AppHeader page={page} unreadCount={appNotifications.length - readNotifications.length} openNotifications={() => setShowNotifications(true)} openProfile={() => setPage("profile")} />
+            <AppHeader page={page} householdName={household.name} profileName={profile.name} unreadCount={appNotifications.length - readNotifications.length} openNotifications={() => setShowNotifications(true)} openProfile={() => setPage("profile")} />
             <main className="px-4 pb-28 pt-5 sm:px-6">
-              {page === "home" && <HomePage setPage={setPage} openDetail={openDetail} />}
+              {page === "home" && <HomePage household={household} setPage={setPage} openDetail={openDetail} />}
               {page === "items" && <ItemsPage category={category} setCategory={setCategory} openDetail={openDetail} addItem={() => setPage("add-item")} notify={notify} />}
               {page === "lists" && <ListsPage completed={completed} setCompleted={setCompleted} addList={() => setPage("add-list")} notify={notify} />}
-              {page === "members" && <MembersPage canAdd={canAdd} setCanAdd={setCanAdd} openMember={(name) => { if (name === "พีรพัฒน์") { setPage("profile"); } else { setSelectedMember(name); setPage("member-profile"); } }} openSettings={() => setPage("settings")} notify={notify} />}
+              {page === "members" && <MembersPage household={household} canAdd={canAdd} setCanAdd={setCanAdd} openMember={(member) => { if (member.you) { setPage("profile"); } else { setSelectedMember(member); setPage("member-profile"); } }} openInvite={() => setPage("invite-members")} openSettings={() => setPage("settings")} notify={notify} />}
             </main>
             <BottomNav page={page} setPage={setPage} />
           </>
@@ -254,18 +412,18 @@ export default function App() {
   );
 }
 
-function AppHeader({ page, unreadCount, openNotifications, openProfile }: { page: Page; unreadCount: number; openNotifications: () => void; openProfile: () => void }) {
+function AppHeader({ page, householdName, profileName, unreadCount, openNotifications, openProfile }: { page: Page; householdName: string; profileName: string; unreadCount: number; openNotifications: () => void; openProfile: () => void }) {
   const titles: Record<string, string> = { home: "บ้านของเรา", items: "สิ่งของทั้งหมด", lists: "รายการร่วมกัน", members: "สมาชิกในบ้าน" };
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-slate-50/95 px-4 pb-3 pt-4 backdrop-blur sm:px-6">
       <div className="flex items-center justify-between">
         <div>
-          <p className="text-[11px] font-medium text-sky-700">KEEPly · ครอบครัวพีรพัฒน์</p>
+          <p className="text-[11px] font-medium text-sky-700">KEEPly · {householdName}</p>
           <Heading level={1} className="mt-0.5 text-xl font-bold tracking-tight">{titles[page]}</Heading>
         </div>
         <div className="flex items-center gap-2">
           <Button onClick={openNotifications} ariaLabel={`การแจ้งเตือนที่ยังไม่ได้อ่าน ${unreadCount} รายการ`} className="relative flex size-10 items-center justify-center rounded-full bg-white text-slate-500 shadow-sm ring-1 ring-slate-200"><Icon name="bell" className="size-5" />{unreadCount > 0 && <span className="absolute -right-1 -top-1 flex size-5 items-center justify-center rounded-full bg-rose-500 text-[9px] font-bold text-white ring-2 ring-slate-50">{unreadCount}</span>}</Button>
-          <Button onClick={openProfile} ariaLabel="เปิดโปรไฟล์" className="flex size-10 items-center justify-center rounded-full bg-sky-200 text-sm font-bold text-sky-800">พ</Button>
+          <Button onClick={openProfile} ariaLabel="เปิดโปรไฟล์" className="flex size-10 items-center justify-center rounded-full bg-sky-200 text-sm font-bold text-sky-800">{initial(profileName)}</Button>
         </div>
       </div>
     </header>
@@ -320,7 +478,8 @@ function NotificationCenter({ readNotifications, setReadNotifications, onClose, 
   );
 }
 
-function HomePage({ setPage, openDetail }: { setPage: (page: Page) => void; openDetail: () => void }) {
+function HomePage({ household, setPage, openDetail }: { household: Household; setPage: (page: Page) => void; openDetail: () => void }) {
+  const percent = spentPercent(household.annualBudget);
   return (
     <div className="space-y-5">
       <section className="overflow-hidden rounded-3xl bg-slate-800 p-5 text-white shadow-lg shadow-slate-200">
@@ -331,7 +490,7 @@ function HomePage({ setPage, openDetail }: { setPage: (page: Page) => void; open
         <div className="mt-5 grid grid-cols-3 divide-x divide-white/10 rounded-2xl bg-white/5 py-3">
           <div className="text-center"><p className="text-xl font-bold">8</p><p className="mt-1 text-[10px] text-slate-400">สิ่งของ</p></div>
           <div className="text-center"><p className="text-xl font-bold">3</p><p className="mt-1 text-[10px] text-slate-400">ต้องซื้อ</p></div>
-          <div className="text-center"><p className="text-xl font-bold">4</p><p className="mt-1 text-[10px] text-slate-400">สมาชิก</p></div>
+          <div className="text-center"><p className="text-xl font-bold">{household.members.length}</p><p className="mt-1 text-[10px] text-slate-400">สมาชิก</p></div>
         </div>
       </section>
 
@@ -342,10 +501,10 @@ function HomePage({ setPage, openDetail }: { setPage: (page: Page) => void; open
             <span className="flex items-center justify-between gap-2"><span className="text-sm font-bold text-slate-800">Year Plan 2568</span><Icon name="chevron" className="size-4 text-sky-600" /></span>
             <span className="mt-1 block text-[11px] text-slate-500">วางแผนของเข้าบ้านและงบประมาณตลอดทั้งปี</span>
             <span className="mt-3 flex items-center gap-2">
-              <span className="h-2 flex-1 overflow-hidden rounded-full bg-white"><span className="block h-full w-[38%] rounded-full bg-sky-500" /></span>
-              <span className="text-[10px] font-semibold text-sky-700">38%</span>
+              <span className="h-2 flex-1 overflow-hidden rounded-full bg-white"><span className="block h-full rounded-full bg-sky-500" style={{ width: `${percent}%` }} /></span>
+              <span className="text-[10px] font-semibold text-sky-700">{percent}%</span>
             </span>
-            <span className="mt-1.5 flex justify-between text-[9px] text-slate-400"><span>ใช้แล้ว ฿18,240</span><span>งบทั้งปี ฿48,000</span></span>
+            <span className="mt-1.5 flex justify-between text-[9px] text-slate-400"><span>ใช้แล้ว {baht(sampleSpent)}</span><span>งบทั้งปี {baht(household.annualBudget)}</span></span>
           </span>
         </span>
       </Button>
@@ -379,8 +538,9 @@ function HomePage({ setPage, openDetail }: { setPage: (page: Page) => void; open
   );
 }
 
-function YearPlanPage({ onBack, notify, addPlan, addExpense, openSubscriptions }: { onBack: () => void; notify: (message: string) => void; addPlan: (quarter: string) => void; addExpense: () => void; openSubscriptions: () => void }) {
+function YearPlanPage({ annualBudget, onBack, notify, addPlan, addExpense, openSubscriptions }: { annualBudget: number; onBack: () => void; notify: (message: string) => void; addPlan: (quarter: string) => void; addExpense: () => void; openSubscriptions: () => void }) {
   const [quarter, setQuarter] = useState("Q2");
+  const percent = spentPercent(annualBudget);
   const quarters = [
     { id: "Q1", label: "ม.ค. – มี.ค.", amount: "฿12,190", status: "เสร็จแล้ว", tone: "bg-emerald-100 text-emerald-700" },
     { id: "Q2", label: "เม.ย. – มิ.ย.", amount: "฿8,550", status: "กำลังดำเนินการ", tone: "bg-sky-100 text-sky-700" },
@@ -436,11 +596,11 @@ function YearPlanPage({ onBack, notify, addPlan, addExpense, openSubscriptions }
       <main className="px-4 pt-5 sm:px-6">
         <section className="overflow-hidden rounded-3xl bg-slate-800 p-5 text-white shadow-lg shadow-slate-200">
           <div className="flex items-start justify-between">
-            <div><p className="text-xs text-slate-400">งบประมาณทั้งปี</p><p className="mt-1 text-3xl font-bold">฿48,000</p></div>
-            <div className="rounded-2xl bg-sky-300/10 px-3 py-2 text-right"><p className="text-[9px] text-slate-400">คงเหลือ</p><p className="text-sm font-bold text-sky-200">฿29,760</p></div>
+            <div><p className="text-xs text-slate-400">งบประมาณทั้งปี</p><p className="mt-1 text-3xl font-bold">{baht(annualBudget)}</p></div>
+            <div className="rounded-2xl bg-sky-300/10 px-3 py-2 text-right"><p className="text-[9px] text-slate-400">คงเหลือ</p><p className="text-sm font-bold text-sky-200">{baht(Math.max(annualBudget - sampleSpent, 0))}</p></div>
           </div>
-          <div className="mt-5 h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full w-[38%] rounded-full bg-gradient-to-r from-sky-400 to-emerald-300" /></div>
-          <div className="mt-2 flex justify-between text-[10px] text-slate-400"><span>ใช้แล้ว ฿18,240</span><span>38% ของแผน</span></div>
+          <div className="mt-5 h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-sky-400 to-emerald-300" style={{ width: `${percent}%` }} /></div>
+          <div className="mt-2 flex justify-between text-[10px] text-slate-400"><span>ใช้แล้ว {baht(sampleSpent)}</span><span>{percent}% ของแผน</span></div>
           <div className="mt-5 grid grid-cols-3 divide-x divide-white/10 rounded-2xl bg-white/5 py-3">
             <div className="text-center"><p className="text-base font-bold">8</p><p className="mt-0.5 text-[9px] text-slate-400">รายการ</p></div>
             <div className="text-center"><p className="text-base font-bold">3</p><p className="mt-0.5 text-[9px] text-slate-400">สำเร็จแล้ว</p></div>
@@ -567,14 +727,18 @@ function ListsPage({ completed, setCompleted, addList, notify }: { completed: nu
   );
 }
 
-function MembersPage({ canAdd, setCanAdd, openMember, openSettings, notify }: { canAdd: boolean; setCanAdd: (value: boolean) => void; openMember: (name: string) => void; openSettings: () => void; notify: (message: string) => void }) {
-  const members = [["พ", "พีรพัฒน์", "เจ้าของบ้าน", "bg-sky-200 text-sky-800"], ["ม", "แม่", "เพิ่มและแก้ไขได้", "bg-rose-200 text-rose-800"], ["พ", "พ่อ", "เพิ่มและแก้ไขได้", "bg-amber-200 text-amber-800"], ["น", "น้องมิน", "ดูอย่างเดียว", "bg-emerald-200 text-emerald-800"]];
+function MembersPage({ household, canAdd, setCanAdd, openMember, openInvite, openSettings, notify }: { household: Household; canAdd: boolean; setCanAdd: (value: boolean) => void; openMember: (member: Member) => void; openInvite: () => void; openSettings: () => void; notify: (message: string) => void }) {
+  const { members, invites } = household;
+  const isOwner = household.role === "owner";
   return (
     <div className="space-y-4">
-      <section className="rounded-3xl bg-sky-700 p-5 text-white"><div className="flex items-center gap-3"><div className="flex size-11 items-center justify-center rounded-2xl bg-white/15"><Icon name="users" className="size-6" /></div><div className="flex-1"><p className="font-semibold">ครอบครัวพีรพัฒน์</p><p className="text-xs text-sky-200">สมาชิก 4 คน · 1 ผู้ดูแล</p></div><Button onClick={openSettings} ariaLabel="ตั้งค่าบ้าน" className="flex size-9 items-center justify-center rounded-xl bg-white/10"><Icon name="settings" className="size-5" /></Button></div><Button onClick={() => notify("คัดลอกลิงก์เชิญสมาชิกแล้ว")} className="mt-5 w-full rounded-xl bg-white py-2.5 text-xs font-semibold text-sky-700">+ เชิญสมาชิกใหม่</Button></section>
+      <section className="rounded-3xl bg-sky-700 p-5 text-white"><div className="flex items-center gap-3"><div className="flex size-11 items-center justify-center rounded-2xl bg-white/15"><Icon name="users" className="size-6" /></div><div className="min-w-0 flex-1"><p className="truncate font-semibold">{household.name}</p><p className="text-xs text-sky-200">สมาชิก {members.length} คน · {members.filter((member) => member.role === "owner").length} ผู้ดูแล</p></div><Button onClick={openSettings} ariaLabel="ตั้งค่าบ้าน" className="flex size-9 items-center justify-center rounded-xl bg-white/10"><Icon name="settings" className="size-5" /></Button></div><Button onClick={isOwner ? openInvite : () => notify("เฉพาะเจ้าของบ้านที่เชิญสมาชิกได้")} className="mt-5 w-full rounded-xl bg-white py-2.5 text-xs font-semibold text-sky-700">+ เชิญสมาชิกใหม่</Button></section>
       <section className="rounded-2xl border border-slate-200 bg-white">
-        {members.map(([avatar, name, role, tone], index) => <Button key={name} onClick={() => openMember(name)} className={`flex w-full items-center gap-3 p-4 text-left ${index < members.length - 1 ? "border-b border-slate-100" : ""}`}><div className={`flex size-10 items-center justify-center rounded-full text-sm font-bold ${tone}`}>{avatar}</div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">{name}</p><p className="text-[11px] text-slate-400">{role}</p></div><Icon name="chevron" className="size-5 text-slate-300" /></Button>)}
+        {members.map((member, index) => <Button key={member.id} onClick={() => openMember(member)} className={`flex w-full items-center gap-3 p-4 text-left ${index < members.length - 1 ? "border-b border-slate-100" : ""}`}><Avatar name={member.name} picture={member.picture} role={member.role} className="size-10 text-sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{member.name}{member.you && <span className="font-normal text-slate-400"> (คุณ)</span>}</p><p className="text-[11px] text-slate-400">{roleLabels[member.role]}</p></div><Icon name="chevron" className="size-5 text-slate-300" /></Button>)}
       </section>
+      {isOwner && invites.length > 0 && (
+        <Button onClick={openInvite} className="flex w-full items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-left"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-amber-700"><Icon name="clock" className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold text-amber-900">รอการตอบรับ {invites.length} ลิงก์</p><p className="truncate text-[11px] text-amber-700">{invites.map((item) => item.name || "สมาชิกใหม่").join(", ")}</p></div><Icon name="chevron" className="size-5 text-amber-400" /></Button>
+      )}
       <section className="rounded-2xl border border-slate-200 bg-white p-4"><div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700"><Icon name="shield" className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">อนุญาตให้เพิ่มข้อมูล</p><p className="text-[11px] text-slate-400">สินค้า งาน และรายการซื้อของ</p></div><Button onClick={() => { setCanAdd(!canAdd); notify(canAdd ? "ปิดสิทธิ์แล้ว" : "เปิดสิทธิ์แล้ว"); }} className={`relative h-7 w-12 rounded-full transition ${canAdd ? "bg-sky-600" : "bg-slate-300"}`}><span className={`absolute top-1 size-5 rounded-full bg-white shadow transition ${canAdd ? "left-6" : "left-1"}`} /></Button></div></section>
     </div>
   );
@@ -592,6 +756,226 @@ function SecondaryHeader({ title, onBack, action }: { title: string; onBack: () 
 
 function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return <div><div className="mb-2 flex items-center justify-between"><p className="text-xs font-semibold text-slate-700">{label}</p>{hint && <span className="text-[10px] text-slate-400">{hint}</span>}</div>{children}</div>;
+}
+
+function LoadingScreen() {
+  return (
+    <div className="flex min-h-screen flex-col items-center justify-center gap-3">
+      <div className="flex size-14 animate-pulse items-center justify-center rounded-2xl bg-sky-700 text-white shadow-lg shadow-sky-200"><Icon name="home" className="size-7" /></div>
+      <p className="text-xs text-slate-400">กำลังเปิด Keeply...</p>
+    </div>
+  );
+}
+
+function Avatar({ name, picture, role, className = "" }: { name: string; picture: string | null; role: Role; className?: string }) {
+  return picture
+    ? <img src={picture} alt="" className={`shrink-0 rounded-full object-cover ${className}`} />
+    : <div className={`flex shrink-0 items-center justify-center rounded-full font-bold ${roleTones[role]} ${className}`}>{initial(name)}</div>;
+}
+
+function SignInPage({ invite, onSignIn }: { invite: InvitePreview | null; onSignIn: () => void }) {
+  const features: { icon: IconName; title: string; detail: string }[] = [
+    { icon: "calendar", title: "ตั้งเป้าหมายงบของบ้าน", detail: "วางงบทั้งปีและรายเดือน แล้วติดตามใน Year Plan" },
+    { icon: "box", title: "รู้ความคุ้มค่าของทุกสิ่งของ", detail: "คำนวณค่าใช้จ่ายต่อวันจากอายุการใช้งานที่ตั้งไว้" },
+    { icon: "users", title: "ดูแลร่วมกันทั้งบ้าน", detail: "เชิญสมาชิกผ่าน LINE และกำหนดสิทธิ์ของแต่ละคน" },
+  ];
+  return (
+    <div className="flex min-h-screen flex-col px-4 pb-8 pt-10 sm:px-6">
+      <div className="flex items-center gap-2.5"><span className="flex size-10 items-center justify-center rounded-2xl bg-sky-700 text-white shadow-lg shadow-sky-200"><Icon name="home" className="size-5" /></span><span className="text-lg font-bold tracking-tight">KEEPly</span></div>
+      {invite ? (
+        <section className="mt-8 rounded-3xl bg-gradient-to-br from-sky-700 to-sky-600 p-5 text-white shadow-lg shadow-sky-200">
+          <span className="rounded-full bg-white/15 px-2.5 py-1 text-[10px] font-semibold">คำเชิญเข้าบ้าน</span>
+          <Heading level={1} className="mt-3 text-xl font-bold leading-snug">{invite.invitedBy} ชวนคุณเข้าร่วม {invite.householdName}</Heading>
+          <p className="mt-2 text-xs leading-5 text-sky-100">สิทธิ์ของคุณ: {roleLabels[invite.role]} · เข้าสู่ระบบด้วย LINE เพื่อตอบรับคำเชิญ</p>
+        </section>
+      ) : (
+        <section className="mt-8">
+          <Heading level={1} className="text-2xl font-bold leading-snug tracking-tight">ดูแลของใช้และค่าใช้จ่าย<br />ของบ้านไปด้วยกัน</Heading>
+          <p className="mt-2 text-sm leading-6 text-slate-500">เข้าสู่ระบบด้วย LINE แล้วตั้งเป้าหมายของบ้านได้ในไม่กี่นาที</p>
+        </section>
+      )}
+      <section className="mt-6 overflow-hidden rounded-2xl border border-slate-200 bg-white">
+        {features.map((item, index) => <div key={item.title} className={`flex items-center gap-3 p-4 ${index < features.length - 1 ? "border-b border-slate-100" : ""}`}><div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-sky-50 text-sky-700"><Icon name={item.icon} className="size-5" /></div><div className="min-w-0"><p className="text-sm font-semibold">{item.title}</p><p className="mt-0.5 text-[10px] text-slate-400">{item.detail}</p></div></div>)}
+      </section>
+      <div className="mt-auto pt-8">
+        <Button onClick={onSignIn} className="flex w-full items-center justify-center gap-3 rounded-2xl bg-emerald-500 py-3.5 text-sm font-bold text-white shadow-lg shadow-emerald-100">
+          <span className="flex size-6 items-center justify-center rounded-md bg-white text-[8px] font-black text-emerald-500">LINE</span>
+          เข้าสู่ระบบด้วย LINE
+        </Button>
+        <p className="mt-3 text-center text-[10px] leading-4 text-slate-400">Keeply ขอใช้ชื่อ รูปโปรไฟล์ และอีเมลจาก LINE · ไม่เห็นรหัสผ่าน LINE ของคุณ</p>
+        {demoMode && <p className="mt-2 text-center text-[9px] leading-4 text-slate-400">ขณะนี้เป็นโหมดตัวอย่างสำหรับตรวจสอบหน้าจอ · การใช้งานจริงต้องกำหนด LINE Channel ID</p>}
+      </div>
+    </div>
+  );
+}
+
+// Where the user is in the two first sign-in steps, with room for an action such as signing out to switch LINE accounts.
+function SetupHeader({ step, action }: { step: 1 | 2; action?: ReactNode }) {
+  return (
+    <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-slate-50/95 px-4 pb-3 pt-4 backdrop-blur sm:px-6">
+      <div className="flex h-6 items-center justify-between"><p className="text-[11px] font-semibold text-sky-700">ตั้งค่าบ้าน · ขั้นตอนที่ {step} จาก 2</p>{action}</div>
+      <div className="mt-2 grid grid-cols-2 gap-1.5">{[1, 2].map((item) => <span key={item} className={`h-1.5 rounded-full ${item <= step ? "bg-sky-600" : "bg-slate-200"}`} />)}</div>
+    </header>
+  );
+}
+
+// Step 1 of the first sign-in, and later the owner's goals settings.
+function HouseholdGoalsPage({ initial, onboarding = false, onBack, onSave, onSignOut }: { initial: Goals; onboarding?: boolean; onBack?: () => void; onSave: (goals: Goals) => Promise<void> | void; onSignOut?: () => void }) {
+  const [name, setName] = useState(initial.name);
+  const [annualBudget, setAnnualBudget] = useState(initial.annualBudget ? String(initial.annualBudget) : "");
+  const [monthlyBudget, setMonthlyBudget] = useState(initial.monthlyBudget ? String(initial.monthlyBudget) : "");
+  const [usageYears, setUsageYears] = useState(initial.usageYears);
+  const [saving, setSaving] = useState(false);
+
+  // Whole baht; anything else leaves the budget unset.
+  const amount = (value: string) => {
+    const number = Math.round(Number(value));
+    return number > 0 && number <= 99_999_999 ? number : 0;
+  };
+  const goals = { name: name.trim(), annualBudget: amount(annualBudget), monthlyBudget: amount(monthlyBudget), usageYears };
+  const ready = goals.name && goals.annualBudget && goals.monthlyBudget;
+  const suggestedMonthly = Math.round(goals.annualBudget / 12 / 100) * 100;
+  const save = () => {
+    setSaving(true);
+    Promise.resolve(onSave(goals)).finally(() => setSaving(false));
+  };
+
+  return (
+    <div className="min-h-screen pb-8">
+      {onboarding ? <SetupHeader step={1} action={onSignOut && <Button onClick={onSignOut} className="text-[11px] font-semibold text-slate-400">ออกจากระบบ</Button>} /> : onBack && <SecondaryHeader title="เป้าหมายของบ้าน" onBack={onBack} />}
+      <main className="px-4 pt-5 sm:px-6">
+        {onboarding && (
+          <section className="mb-5">
+            <Heading level={1} className="text-xl font-bold">ตั้งเป้าหมายของบ้าน</Heading>
+            <p className="mt-1 text-xs leading-5 text-slate-500">Keeply ใช้เป้าหมายเหล่านี้วางแผนงบและคำนวณความคุ้มค่าของสิ่งของ แก้ไขภายหลังได้ที่การตั้งค่า</p>
+          </section>
+        )}
+        <section className="space-y-5 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div><Heading level={2} className="text-base font-bold">บ้านของคุณ</Heading><p className="mt-1 text-[11px] text-slate-400">สมาชิกที่คุณเชิญจะเห็นชื่อนี้</p></div>
+          <Field label="ชื่อบ้าน" hint="จำเป็น"><Input value={name} onChange={(value) => setName(value.slice(0, 50))} placeholder="เช่น ครอบครัวใจดี" /></Field>
+        </section>
+
+        <section className="mt-4 space-y-5 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div><Heading level={2} className="text-base font-bold">เป้าหมายงบประมาณ</Heading><p className="mt-1 text-[11px] text-slate-400">ใช้ใน Year Plan และแจ้งเตือนเมื่อใช้จ่ายเกินงบ</p></div>
+          <Field label="งบประมาณทั้งปี" hint="บาท">
+            <Input value={annualBudget} onChange={setAnnualBudget} type="number" placeholder="เช่น 48000" />
+            <div className="mt-2 flex flex-wrap gap-2">{[24000, 48000, 100000].map((item) => <Button key={item} onClick={() => setAnnualBudget(String(item))} className={`rounded-full px-3 py-1.5 text-[11px] font-medium ${goals.annualBudget === item ? "bg-sky-700 text-white" : "bg-slate-100 text-slate-500"}`}>{baht(item)}</Button>)}</div>
+          </Field>
+          <Field label="งบใช้จ่ายต่อเดือน" hint="บาท">
+            <Input value={monthlyBudget} onChange={setMonthlyBudget} type="number" placeholder="เช่น 4000" />
+            {suggestedMonthly > 0 && goals.monthlyBudget !== suggestedMonthly && <Button onClick={() => setMonthlyBudget(String(suggestedMonthly))} className="mt-2 rounded-full bg-sky-50 px-3 py-1.5 text-[11px] font-medium text-sky-700">ใช้ {baht(suggestedMonthly)} (งบทั้งปี ÷ 12)</Button>}
+          </Field>
+        </section>
+
+        <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <Heading level={2} className="text-base font-bold">เป้าหมายการใช้งานสิ่งของ</Heading>
+          <p className="mt-1 text-[11px] leading-5 text-slate-400">ตั้งใจใช้ของแต่ละชิ้นนานเท่าไร ระบบใช้คำนวณค่าเฉลี่ยต่อวัน และปรับรายชิ้นได้ตอนเพิ่มสิ่งของ</p>
+          <div className="mt-4 flex gap-2">{usagePeriods.map((item) => <Button key={item} onClick={() => setUsageYears(item)} className={`flex-1 rounded-xl py-2.5 text-xs font-semibold ${usageYears === item ? "bg-sky-700 text-white" : "bg-slate-100 text-slate-500"}`}>{item} ปี</Button>)}</div>
+        </section>
+
+        <Button onClick={ready && !saving ? save : undefined} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold ${ready ? "bg-sky-700 text-white shadow-lg shadow-sky-200" : "cursor-not-allowed bg-slate-200 text-slate-400"}`}>
+          {saving ? "กำลังบันทึก..." : onboarding ? <>ถัดไป: เชิญสมาชิกในบ้าน <Icon name="chevron" className="size-5" /></> : <><Icon name="check" className="size-5" /> บันทึกเป้าหมาย</>}
+        </Button>
+        {!ready && <p className="mt-2 text-center text-[10px] text-slate-400">กรอกชื่อบ้านและงบประมาณทั้งสองช่องเพื่อไปต่อ</p>}
+      </main>
+    </div>
+  );
+}
+
+// Step 2 of the first sign-in, and later the owner's way to invite more members from the members page.
+function InviteMembersPage({ household, inviterName, onboarding, onBack, onCreate, onRevoke, onDone, notify }: { household: Household; inviterName: string; onboarding: boolean; onBack: () => void; onCreate: (name: string, role: InviteRole) => Promise<string | null>; onRevoke: (id: number) => void; onDone: () => void; notify: (message: string) => void }) {
+  const [name, setName] = useState("");
+  const [role, setRole] = useState<InviteRole>("editor");
+  const [creating, setCreating] = useState(false);
+  const [link, setLink] = useState<{ url: string; name: string } | null>(null);
+  const roleOptions: { id: InviteRole; detail: string }[] = [
+    { id: "editor", detail: "เพิ่มสิ่งของ รายการ และค่าใช้จ่ายได้" },
+    { id: "viewer", detail: "ดูข้อมูลของบ้านได้ แต่แก้ไขไม่ได้" },
+  ];
+
+  const create = () => {
+    setCreating(true);
+    onCreate(name.trim(), role).then((url) => {
+      setCreating(false);
+      if (!url) return;
+      setLink({ url, name: name.trim() });
+      setName("");
+    });
+  };
+  const message = link ? `${inviterName} ชวนคุณเข้าร่วม "${household.name}" บน Keeply\nกดลิงก์แล้วเข้าสู่ระบบด้วย LINE ได้เลย\n${link.url}` : "";
+  const copy = () => {
+    if (!link) return;
+    (navigator.clipboard?.writeText(link.url) ?? Promise.reject())
+      .then(() => notify("คัดลอกลิงก์เชิญแล้ว"), () => notify("คัดลอกไม่สำเร็จ กรุณากดค้างที่ลิงก์เพื่อคัดลอก"));
+  };
+
+  return (
+    <div className="min-h-screen pb-8">
+      {onboarding ? <SetupHeader step={2} /> : <SecondaryHeader title="เชิญสมาชิก" onBack={onBack} />}
+      <main className="px-4 pt-5 sm:px-6">
+        {onboarding && (
+          <section className="mb-5">
+            <Heading level={1} className="text-xl font-bold">ชวนสมาชิกในบ้าน</Heading>
+            <p className="mt-1 text-xs leading-5 text-slate-500">ตั้งเป้าหมายของ {household.name} เรียบร้อยแล้ว ส่งลิงก์ให้คนในบ้านเข้ามาดูแลด้วยกัน</p>
+          </section>
+        )}
+        <section className="space-y-5 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div><Heading level={2} className="text-base font-bold">สร้างลิงก์เชิญ</Heading><p className="mt-1 text-[11px] text-slate-400">หนึ่งลิงก์ใช้เข้าร่วมได้ 1 คน ภายใน 7 วัน</p></div>
+          <Field label="เชิญใคร" hint="ไม่บังคับ"><Input value={name} onChange={(value) => setName(value.slice(0, 50))} placeholder="เช่น แม่ พ่อ หรือชื่อเล่น" /></Field>
+          <Field label="สิทธิ์ในบ้าน">
+            <div className="space-y-2">
+              {roleOptions.map((option) => (
+                <Button key={option.id} onClick={() => setRole(option.id)} className={`flex w-full items-center gap-3 rounded-2xl p-3 text-left ring-1 ${role === option.id ? "bg-sky-50 ring-sky-300" : "bg-slate-50 ring-slate-200"}`}>
+                  <span className={`flex size-5 shrink-0 items-center justify-center rounded-full border ${role === option.id ? "border-sky-600 bg-sky-600 text-white" : "border-slate-300"}`}>{role === option.id && <Icon name="check" className="size-3" />}</span>
+                  <span><span className="block text-xs font-semibold">{roleLabels[option.id]}</span><span className="mt-0.5 block text-[9px] text-slate-400">{option.detail}</span></span>
+                </Button>
+              ))}
+            </div>
+          </Field>
+          <Button onClick={creating ? undefined : create} className="flex w-full items-center justify-center gap-2 rounded-2xl bg-sky-700 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-200"><Icon name="plus" className="size-5" />{creating ? "กำลังสร้างลิงก์..." : "สร้างลิงก์เชิญ"}</Button>
+        </section>
+
+        {link && (
+          <section className="mt-4 rounded-3xl border border-emerald-200 bg-emerald-50 p-4">
+            <div className="flex items-center gap-3"><div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-emerald-600"><Icon name="check" className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold text-emerald-900">ลิงก์สำหรับ{link.name ? ` ${link.name} ` : "สมาชิกใหม่"}พร้อมแล้ว</p><p className="mt-0.5 text-[10px] text-emerald-700">ส่งให้คนนี้คนเดียว ลิงก์จะหมดอายุใน 7 วัน</p></div></div>
+            <p className="mt-3 select-all break-all rounded-xl bg-white px-3 py-2.5 font-mono text-[10px] text-slate-600 ring-1 ring-emerald-100">{link.url}</p>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <a href={`https://line.me/R/share?text=${encodeURIComponent(message)}`} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 rounded-xl bg-emerald-500 py-2.5 text-xs font-bold text-white"><span className="flex size-5 items-center justify-center rounded bg-white text-[7px] font-black text-emerald-500">LINE</span>ส่งทาง LINE</a>
+              <Button onClick={copy} className="rounded-xl bg-white py-2.5 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200">คัดลอกลิงก์</Button>
+            </div>
+            {demoMode && <p className="mt-2 text-center text-[9px] text-emerald-700">โหมดตัวอย่าง · ลิงก์นี้ยังใช้เข้าร่วมบ้านไม่ได้จริง</p>}
+          </section>
+        )}
+
+        {household.invites.length > 0 && (
+          <section className="mt-5">
+            <Heading level={2} className="mb-3 text-sm font-bold">รอการตอบรับ</Heading>
+            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+              {household.invites.map((item, index) => (
+                <div key={item.id} className={`flex items-center gap-3 p-4 ${index < household.invites.length - 1 ? "border-b border-slate-100" : ""}`}>
+                  <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700"><Icon name="clock" className="size-5" /></div>
+                  <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{item.name || "สมาชิกใหม่"}</p><p className="mt-0.5 text-[10px] text-slate-400">{roleLabels[item.role]} · หมดอายุ {thaiDate(item.expiresAt)}</p></div>
+                  <Button onClick={() => { onRevoke(item.id); setLink(null); }} className="rounded-xl bg-slate-100 px-3 py-2 text-[10px] font-semibold text-slate-600">ยกเลิก</Button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <section className="mt-5">
+          <Heading level={2} className="mb-3 text-sm font-bold">สมาชิกตอนนี้ · {household.members.length} คน</Heading>
+          <div className="flex flex-wrap gap-2">{household.members.map((member) => <span key={member.id} className="flex items-center gap-2 rounded-full bg-white py-1 pl-1 pr-3 text-xs font-medium ring-1 ring-slate-200"><Avatar name={member.name} picture={member.picture} role={member.role} className="size-7 text-[11px]" />{member.name}{member.you && " (คุณ)"}</span>)}</div>
+        </section>
+
+        {onboarding && (
+          <>
+            <Button onClick={onDone} className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-800 py-3.5 text-sm font-semibold text-white">{household.invites.length ? "เสร็จสิ้น เริ่มใช้งาน Keeply" : "ข้ามไปก่อน เริ่มใช้งาน Keeply"}</Button>
+            <p className="mt-2 text-center text-[10px] text-slate-400">เชิญเพิ่มได้ทุกเมื่อที่หน้าสมาชิก</p>
+          </>
+        )}
+      </main>
+    </div>
+  );
 }
 
 function AddSharedListPage({ onBack, onSave }: { onBack: () => void; onSave: () => void }) {
@@ -680,8 +1064,9 @@ function AddSharedListPage({ onBack, onSave }: { onBack: () => void; onSave: () 
   );
 }
 
-function AddItemPage({ onBack, onSave }: { onBack: () => void; onSave: () => void }) {
+function AddItemPage({ usageYears, onBack, onSave }: { usageYears: number; onBack: () => void; onSave: () => void }) {
   const [name, setName] = useState("");
+  const [years, setYears] = useState(usageYears);
   const [price, setPrice] = useState("");
   const [date, setDate] = useState("2025-05-24");
   const [channel, setChannel] = useState("");
@@ -733,8 +1118,8 @@ function AddItemPage({ onBack, onSave }: { onBack: () => void; onSave: () => voi
 
         <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
           <Heading level={2} className="text-base font-bold">เป้าหมายการใช้งาน</Heading>
-          <p className="mt-1 text-[11px] text-slate-400">ระบบจะใช้ระยะเวลานี้คำนวณค่าเฉลี่ยต่อวัน</p>
-          <div className="mt-4 flex gap-2">{["1 ปี", "2 ปี", "3 ปี", "5 ปี"].map((item, index) => <Button key={item} className={`flex-1 rounded-xl py-2.5 text-xs font-semibold ${index === 1 ? "bg-sky-700 text-white" : "bg-slate-100 text-slate-500"}`}>{item}</Button>)}</div>
+          <p className="mt-1 text-[11px] text-slate-400">ระบบจะใช้ระยะเวลานี้คำนวณค่าเฉลี่ยต่อวัน · ค่าเริ่มต้นจากเป้าหมายของบ้าน</p>
+          <div className="mt-4 flex gap-2">{usagePeriods.map((item) => <Button key={item} onClick={() => setYears(item)} className={`flex-1 rounded-xl py-2.5 text-xs font-semibold ${years === item ? "bg-sky-700 text-white" : "bg-slate-100 text-slate-500"}`}>{item} ปี</Button>)}</div>
         </section>
 
         <Button onClick={name && price ? onSave : undefined} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold shadow-lg ${name && price ? "bg-sky-700 text-white shadow-sky-200" : "cursor-not-allowed bg-slate-200 text-slate-400 shadow-transparent"}`}><Icon name="check" className="size-5" /> บันทึกสิ่งของ</Button>
@@ -785,23 +1170,20 @@ function NotificationDetailPage({ notificationId, onBack, openYearPlan }: { noti
   );
 }
 
-function MemberProfilePage({ memberName, onBack, notify }: { memberName: string; onBack: () => void; notify: (message: string) => void }) {
-  const profiles: Record<string, { avatar: string; role: string; joined: string; email: string; tone: string; items: string; tasks: string; spending: string; permission: string; activities: string[] }> = {
-    แม่: { avatar: "ม", role: "สมาชิกในบ้าน", joined: "เข้าร่วมเมื่อ 12 ม.ค. 2568", email: "mae@keeply.family", tone: "from-rose-500 to-rose-400", items: "5", tasks: "12", spending: "฿6,840", permission: "เพิ่มและแก้ไขข้อมูลได้", activities: ["เพิ่มรายการซื้อหลอดไฟห้องครัว", "บันทึกค่าใช้จ่ายของใช้ในบ้าน ฿890", "ทำรายการซื้อของเสร็จ 2 รายการ"] },
-    พ่อ: { avatar: "พ", role: "สมาชิกในบ้าน", joined: "เข้าร่วมเมื่อ 12 ม.ค. 2568", email: "por@keeply.family", tone: "from-amber-500 to-amber-400", items: "3", tasks: "8", spending: "฿8,000", permission: "เพิ่มและแก้ไขข้อมูลได้", activities: ["เพิ่มแผนเปลี่ยนโทรศัพท์ใน Q3", "อัปเดตราคาชั้นวางของ", "รับมอบหมายงานประกอบชั้น"] },
-    น้องมิน: { avatar: "น", role: "สมาชิกในบ้าน", joined: "เข้าร่วมเมื่อ 2 ก.พ. 2568", email: "min@keeply.family", tone: "from-emerald-500 to-emerald-400", items: "1", tasks: "4", spending: "฿500", permission: "ดูข้อมูลได้อย่างเดียว", activities: ["ดู Year Plan ของครอบครัว", "เพิ่มความคิดเห็นในรายการโทรศัพท์", "ดูรายละเอียดเครื่องชงกาแฟ"] },
-  };
-  const profile = profiles[memberName] ?? profiles["แม่"];
+function MemberProfilePage({ member, onBack, notify }: { member: Member; onBack: () => void; notify: (message: string) => void }) {
+  // Activity isn't recorded yet, so the figures and timeline are sample content like the other demo screens.
+  const profile = { items: "5", tasks: "12", spending: "฿6,840", activities: ["เพิ่มรายการซื้อหลอดไฟห้องครัว", "บันทึกค่าใช้จ่ายของใช้ในบ้าน ฿890", "ทำรายการซื้อของเสร็จ 2 รายการ"] };
+  const tones: Record<Role, string> = { owner: "from-sky-700 to-sky-600", editor: "from-amber-500 to-amber-400", viewer: "from-emerald-500 to-emerald-400" };
+  const permissions: Record<Role, string> = { owner: "จัดการบ้านและสมาชิกได้ทั้งหมด", editor: "เพิ่มและแก้ไขข้อมูลได้", viewer: "ดูข้อมูลได้อย่างเดียว" };
 
   return (
     <div className="min-h-screen pb-8">
-      <SecondaryHeader title="โปรไฟล์สมาชิก" onBack={onBack} action={<Button onClick={() => notify(`เปิดเมนูจัดการ ${memberName}`)} ariaLabel="จัดการสมาชิก" className="flex size-10 items-center justify-center rounded-full bg-white text-slate-600 ring-1 ring-slate-200"><Icon name="more" className="size-5" /></Button>} />
+      <SecondaryHeader title="โปรไฟล์สมาชิก" onBack={onBack} action={<Button onClick={() => notify(`เปิดเมนูจัดการ ${member.name}`)} ariaLabel="จัดการสมาชิก" className="flex size-10 items-center justify-center rounded-full bg-white text-slate-600 ring-1 ring-slate-200"><Icon name="more" className="size-5" /></Button>} />
       <main className="px-4 pt-5 sm:px-6">
-        <section className={`rounded-3xl bg-gradient-to-br ${profile.tone} p-6 text-center text-white shadow-lg`}>
-          <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-white/20 text-2xl font-bold ring-4 ring-white/20">{profile.avatar}</div>
-          <Heading level={1} className="mt-4 text-xl font-bold">{memberName}</Heading>
-          <p className="mt-1 text-xs text-white/75">{profile.role} · {profile.joined}</p>
-          <p className="mt-3 text-[10px] text-white/70">{profile.email}</p>
+        <section className={`rounded-3xl bg-gradient-to-br ${tones[member.role]} p-6 text-center text-white shadow-lg`}>
+          {member.picture ? <img src={member.picture} alt="" className="mx-auto size-20 rounded-full object-cover ring-4 ring-white/20" /> : <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-white/20 text-2xl font-bold ring-4 ring-white/20">{initial(member.name)}</div>}
+          <Heading level={1} className="mt-4 text-xl font-bold">{member.name}</Heading>
+          <p className="mt-1 text-xs text-white/75">{roleLabels[member.role]} · เข้าร่วมเมื่อ {thaiDate(member.joinedAt)}</p>
         </section>
 
         <div className="mt-4 grid grid-cols-3 gap-2">
@@ -809,7 +1191,7 @@ function MemberProfilePage({ memberName, onBack, notify }: { memberName: string;
         </div>
 
         <section className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
-          <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700"><Icon name="shield" className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">สิทธิ์การใช้งาน</p><p className="mt-0.5 text-[10px] text-slate-400">{profile.permission}</p></div><Button onClick={() => notify(`พร้อมแก้ไขสิทธิ์ของ ${memberName}`)} className="rounded-xl bg-slate-100 px-3 py-2 text-[10px] font-semibold text-slate-600">จัดการ</Button></div>
+          <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700"><Icon name="shield" className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">สิทธิ์การใช้งาน</p><p className="mt-0.5 text-[10px] text-slate-400">{permissions[member.role]}</p></div><Button onClick={() => notify(`พร้อมแก้ไขสิทธิ์ของ ${member.name}`)} className="rounded-xl bg-slate-100 px-3 py-2 text-[10px] font-semibold text-slate-600">จัดการ</Button></div>
         </section>
 
         <section className="mt-5">
@@ -967,7 +1349,7 @@ function EditProfilePage({ profile, onBack, onSave }: { profile: { name: string;
       <main className="px-4 pt-5 sm:px-6">
         <section className="rounded-3xl border border-slate-200 bg-white p-5 text-center shadow-sm">
           <div className="relative mx-auto w-fit">
-            <div className="flex size-24 items-center justify-center rounded-full bg-gradient-to-br from-sky-200 to-sky-100 text-3xl font-bold text-sky-800 ring-4 ring-sky-50">{name.trim().charAt(0) || "พ"}</div>
+            <div className="flex size-24 items-center justify-center rounded-full bg-gradient-to-br from-sky-200 to-sky-100 text-3xl font-bold text-sky-800 ring-4 ring-sky-50">{initial(name)}</div>
             <Button ariaLabel="เปลี่ยนรูปโปรไฟล์" className="absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-sky-700 text-white shadow-lg ring-4 ring-white"><Icon name="camera" className="size-4" /></Button>
           </div>
           <p className="mt-4 text-sm font-semibold">รูปโปรไฟล์</p>
@@ -1005,94 +1387,39 @@ function EditProfilePage({ profile, onBack, onSave }: { profile: { name: string;
   );
 }
 
-function LineLoginPage({ connected, profileName, onBack, onConnected, onDisconnected }: { connected: boolean; profileName: string; onBack: () => void; onConnected: () => void; onDisconnected: () => void }) {
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [allowProfile, setAllowProfile] = useState(true);
-  const [allowNotifications, setAllowNotifications] = useState(true);
-
-  const connectLine = () => {
-    const channelId = import.meta.env.VITE_LINE_CHANNEL_ID;
-    if (channelId) {
-      const state = crypto.randomUUID();
-      const nonce = crypto.randomUUID();
-      sessionStorage.setItem("keeply_line_oauth_state", state);
-      sessionStorage.setItem("keeply_line_oauth_nonce", nonce);
-      const authorizeUrl = new URL("https://access.line.me/oauth2/v2.1/authorize");
-      authorizeUrl.searchParams.set("response_type", "code");
-      authorizeUrl.searchParams.set("client_id", channelId);
-      authorizeUrl.searchParams.set("redirect_uri", lineCallbackUrl());
-      authorizeUrl.searchParams.set("state", state);
-      authorizeUrl.searchParams.set("scope", "profile openid email");
-      authorizeUrl.searchParams.set("nonce", nonce);
-      window.location.assign(authorizeUrl.toString());
-      return;
-    }
-    setIsConnecting(true);
-    window.setTimeout(() => {
-      setIsConnecting(false);
-      onConnected();
-    }, 900);
-  };
-
+function LineLoginPage({ profileName, onBack, onDisconnected }: { profileName: string; onBack: () => void; onDisconnected: () => void }) {
   return (
     <div className="min-h-screen pb-8">
-      <SecondaryHeader title="เชื่อมต่อ LINE Login" onBack={onBack} />
+      <SecondaryHeader title="LINE Login" onBack={onBack} />
       <main className="px-4 pt-5 sm:px-6">
         <section className="rounded-3xl bg-gradient-to-br from-emerald-500 to-green-500 p-6 text-center text-white shadow-lg shadow-emerald-100">
           <div className="mx-auto flex size-20 items-center justify-center rounded-3xl bg-white text-xl font-black tracking-tight text-emerald-500 shadow-lg">LINE</div>
-          <Heading level={1} className="mt-5 text-xl font-bold">{connected ? "เชื่อมต่อ LINE แล้ว" : "เข้าสู่ระบบด้วย LINE"}</Heading>
-          <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-white/80">{connected ? `บัญชี LINE เชื่อมกับโปรไฟล์ ${profileName} และพร้อมรับการแจ้งเตือน` : "เชื่อมบัญชีเพื่อเข้าสู่ Keeply ได้เร็วขึ้น และรับการแจ้งเตือนค่าใช้จ่ายผ่าน LINE"}</p>
+          <Heading level={1} className="mt-5 text-xl font-bold">เชื่อมต่อ LINE แล้ว</Heading>
+          <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-white/80">บัญชี LINE เชื่อมกับโปรไฟล์ {profileName} และพร้อมรับการแจ้งเตือน</p>
         </section>
-
-        {connected ? (
-          <>
-            <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="flex items-center gap-3"><div className="flex size-12 items-center justify-center rounded-full bg-emerald-100 text-sm font-bold text-emerald-700">พ</div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">{profileName}</p><p className="mt-0.5 text-[10px] text-slate-400">LINE ID · เชื่อมต่อเมื่อวันนี้</p></div><span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[9px] font-semibold text-emerald-700">เชื่อมต่อแล้ว</span></div>
-            </section>
-            <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white">
-              <div className="flex items-center gap-3 border-b border-slate-100 p-4"><Icon name="shield" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">เข้าสู่ระบบอย่างปลอดภัย</p><p className="mt-0.5 text-[9px] text-slate-400">ใช้ LINE ยืนยันตัวตนแทนรหัสผ่าน</p></div></div>
-              <div className="flex items-center gap-3 p-4"><Icon name="bell" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">รับการแจ้งเตือนผ่าน LINE</p><p className="mt-0.5 text-[9px] text-slate-400">งบเกินกำหนด ค่างวด และรายการจากสมาชิก</p></div></div>
-            </section>
-            <Button onClick={onDisconnected} className="mt-5 w-full rounded-2xl border border-rose-200 bg-rose-50 py-3.5 text-sm font-semibold text-rose-600">ยกเลิกการเชื่อมต่อ LINE</Button>
-          </>
-        ) : (
-          <>
-            <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-              <Heading level={2} className="text-sm font-bold">ข้อมูลที่ Keeply ขอเข้าถึง</Heading>
-              <p className="mt-1 text-[10px] text-slate-400">คุณสามารถเปลี่ยนสิทธิ์การแจ้งเตือนได้ภายหลัง</p>
-              <div className="mt-4 space-y-3">
-                <LinePermission icon="user" title="โปรไฟล์พื้นฐาน" detail="ชื่อ รูปโปรไฟล์ และอีเมล" active={allowProfile} toggle={() => setAllowProfile(!allowProfile)} />
-                <LinePermission icon="bell" title="การแจ้งเตือนจาก Keeply" detail="แจ้งเตือนงบและรายการที่ใกล้ถึงกำหนด" active={allowNotifications} toggle={() => setAllowNotifications(!allowNotifications)} />
-              </div>
-            </section>
-            <section className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-4">
-              <div className="flex gap-3"><Icon name="shield" className="mt-0.5 size-5 shrink-0 text-sky-700" /><p className="text-[10px] leading-5 text-sky-700">Keeply จะไม่เห็นรหัสผ่าน LINE และจะใช้ข้อมูลตามสิทธิ์ที่คุณอนุญาตเท่านั้น คุณสามารถยกเลิกการเชื่อมต่อได้ทุกเมื่อ</p></div>
-            </section>
-            <Button onClick={allowProfile && !isConnecting ? connectLine : undefined} className={`mt-5 flex w-full items-center justify-center gap-3 rounded-2xl py-3.5 text-sm font-bold ${allowProfile ? "bg-emerald-500 text-white shadow-lg shadow-emerald-100" : "cursor-not-allowed bg-slate-200 text-slate-400"}`}>
-              <span className="flex size-6 items-center justify-center rounded-md bg-white text-[8px] font-black text-emerald-500">LINE</span>
-              {isConnecting ? "กำลังเชื่อมต่อ..." : "เข้าสู่ระบบด้วย LINE"}
-            </Button>
-            {!import.meta.env.VITE_LINE_CHANNEL_ID && <p className="mt-3 text-center text-[9px] leading-4 text-slate-400">ขณะนี้เป็นโหมดตัวอย่างสำหรับตรวจสอบหน้าจอ · การใช้งานจริงต้องกำหนด LINE Channel ID</p>}
-          </>
-        )}
+        <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex items-center gap-3"><div className="flex size-12 items-center justify-center rounded-full bg-emerald-100 text-sm font-bold text-emerald-700">{initial(profileName)}</div><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{profileName}</p><p className="mt-0.5 text-[10px] text-slate-400">ใช้ LINE เข้าสู่ระบบ Keeply</p></div><span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[9px] font-semibold text-emerald-700">เชื่อมต่อแล้ว</span></div>
+        </section>
+        <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white">
+          <div className="flex items-center gap-3 border-b border-slate-100 p-4"><Icon name="shield" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">เข้าสู่ระบบอย่างปลอดภัย</p><p className="mt-0.5 text-[9px] text-slate-400">ใช้ LINE ยืนยันตัวตนแทนรหัสผ่าน</p></div></div>
+          <div className="flex items-center gap-3 p-4"><Icon name="bell" className="size-5 text-sky-700" /><div><p className="text-xs font-semibold">รับการแจ้งเตือนผ่าน LINE</p><p className="mt-0.5 text-[9px] text-slate-400">งบเกินกำหนด ค่างวด และรายการจากสมาชิก</p></div></div>
+        </section>
+        <Button onClick={onDisconnected} className="mt-5 w-full rounded-2xl border border-rose-200 bg-rose-50 py-3.5 text-sm font-semibold text-rose-600">ยกเลิกการเชื่อมต่อและออกจากระบบ</Button>
+        <p className="mt-2 text-center text-[10px] text-slate-400">Keeply ใช้ LINE เป็นช่องทางเข้าสู่ระบบเพียงช่องทางเดียว</p>
       </main>
     </div>
   );
 }
 
-function LinePermission({ icon, title, detail, active, toggle }: { icon: IconName; title: string; detail: string; active: boolean; toggle: () => void }) {
-  return <div className="flex items-center gap-3 rounded-2xl bg-slate-50 p-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-slate-600"><Icon name={icon} className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-xs font-semibold">{title}</p><p className="mt-0.5 text-[9px] text-slate-400">{detail}</p></div><Button onClick={toggle} ariaLabel={title} className={`relative h-7 w-12 rounded-full transition ${active ? "bg-emerald-500" : "bg-slate-300"}`}><span className={`absolute top-1 size-5 rounded-full bg-white shadow transition ${active ? "left-6" : "left-1"}`} /></Button></div>;
-}
-
-function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openSettings, onSignOut, notify }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; lineConnected: boolean; onBack: () => void; openEdit: () => void; openLine: () => void; openSettings: () => void; onSignOut: () => void; notify: (message: string) => void }) {
+function ProfilePage({ profile, household, onBack, openEdit, openLine, openSettings, onSignOut, notify }: { profile: { name: string; email: string; phone: string; birthday: string; bio: string }; household: Household; onBack: () => void; openEdit: () => void; openLine: () => void; openSettings: () => void; onSignOut: () => void; notify: (message: string) => void }) {
   return (
     <div className="min-h-screen pb-8">
       <SecondaryHeader title="โปรไฟล์สมาชิก" onBack={onBack} action={<Button onClick={openSettings} ariaLabel="ตั้งค่า" className="flex size-10 items-center justify-center rounded-full bg-white text-slate-600 ring-1 ring-slate-200"><Icon name="settings" className="size-5" /></Button>} />
       <main className="px-4 pt-5 sm:px-6">
         <section className="rounded-3xl bg-gradient-to-br from-sky-700 to-sky-600 p-6 text-center text-white shadow-lg shadow-sky-200">
-          <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-sky-200 text-2xl font-bold text-sky-800 ring-4 ring-white/20">{profile.name.charAt(0) || "พ"}</div>
+          <div className="mx-auto flex size-20 items-center justify-center rounded-full bg-sky-200 text-2xl font-bold text-sky-800 ring-4 ring-white/20">{initial(profile.name)}</div>
           <Heading level={2} className="mt-4 text-xl font-bold">{profile.name}</Heading>
-          <p className="mt-1 text-xs text-sky-200">เจ้าของบ้าน · ผู้ดูแลระบบ</p>
+          <p className="mt-1 text-xs text-sky-200">{roleLabels[household.role]} · {household.name}</p>
           <Button onClick={openEdit} className="mt-5 rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold">แก้ไขโปรไฟล์</Button>
         </section>
         <div className="mt-4 grid grid-cols-3 gap-2">
@@ -1100,8 +1427,8 @@ function ProfilePage({ profile, lineConnected, onBack, openEdit, openLine, openS
         </div>
         <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white">
           <ProfileRow icon="user" title="ข้อมูลส่วนตัว" detail={`${profile.email} · ${profile.phone}`} onClick={openEdit} />
-          <ProfileRow icon="user" title="LINE Login" detail={lineConnected ? "เชื่อมต่อแล้ว · รับการแจ้งเตือนผ่าน LINE" : "ยังไม่ได้เชื่อมต่อบัญชี LINE"} onClick={openLine} />
-          <ProfileRow icon="shield" title="บทบาทในบ้าน" detail="เจ้าของบ้าน · จัดการได้ทั้งหมด" onClick={() => notify("เปิดรายละเอียดสิทธิ์")} />
+          <ProfileRow icon="user" title="LINE Login" detail={demoMode ? "โหมดตัวอย่าง · ยังไม่ได้เชื่อมต่อ LINE จริง" : "เชื่อมต่อแล้ว · รับการแจ้งเตือนผ่าน LINE"} onClick={openLine} />
+          <ProfileRow icon="shield" title="บทบาทในบ้าน" detail={`${roleLabels[household.role]} · ${household.name}`} onClick={() => notify("เปิดรายละเอียดสิทธิ์")} />
           <ProfileRow icon="settings" title="การตั้งค่า" detail="การแจ้งเตือน ความเป็นส่วนตัว" onClick={openSettings} last />
         </section>
         <Button onClick={onSignOut} className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 py-3 text-sm font-semibold text-rose-600"><Icon name="logout" className="size-5" /> ออกจากระบบ</Button>
@@ -1114,7 +1441,7 @@ function ProfileRow({ icon, title, detail, onClick, last }: { icon: IconName; ti
   return <Button onClick={onClick} className={`flex w-full items-center gap-3 p-4 text-left ${last ? "" : "border-b border-slate-100"}`}><div className="flex size-10 items-center justify-center rounded-xl bg-slate-100 text-slate-600"><Icon name={icon} className="size-5" /></div><div className="min-w-0 flex-1"><p className="text-sm font-semibold">{title}</p><p className="mt-0.5 text-[10px] text-slate-400">{detail}</p></div><Icon name="chevron" className="size-4 text-slate-300" /></Button>;
 }
 
-function SettingsPage({ onBack, notify }: { onBack: () => void; notify: (message: string) => void }) {
+function SettingsPage({ household, onBack, openGoals, openMembers, notify }: { household: Household; onBack: () => void; openGoals: () => void; openMembers: () => void; notify: (message: string) => void }) {
   const [notifications, setNotifications] = useState(true);
   const [installments, setInstallments] = useState(true);
   const [approval, setApproval] = useState(true);
@@ -1130,7 +1457,8 @@ function SettingsPage({ onBack, notify }: { onBack: () => void; notify: (message
         <p className="mb-2 mt-5 px-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">การจัดการบ้าน</p>
         <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
           <SettingToggle icon="shield" title="อนุมัติสินค้าราคาสูง" detail="รายการมูลค่าเกิน ฿3,000" active={approval} toggle={() => setApproval(!approval)} />
-          <ProfileRow icon="users" title="จัดการสมาชิก" detail="4 สมาชิก · 1 ผู้ดูแล" onClick={() => notify("กลับไปจัดการที่หน้าสมาชิกได้")} />
+          <ProfileRow icon="sparkle" title="เป้าหมายของบ้าน" detail={`งบปี ${baht(household.annualBudget)} · เดือนละ ${baht(household.monthlyBudget)} · ใช้ของ ${household.usageYears} ปี`} onClick={household.role === "owner" ? openGoals : () => notify("เฉพาะเจ้าของบ้านที่แก้ไขเป้าหมายได้")} />
+          <ProfileRow icon="users" title="จัดการสมาชิก" detail={`${household.members.length} สมาชิก · ${household.members.filter((member) => member.role === "owner").length} ผู้ดูแล`} onClick={openMembers} />
           <ProfileRow icon="tag" title="จัดการหมวดหมู่" detail="4 หมวดหมู่ที่ใช้งาน" onClick={() => notify("เปิดการจัดการหมวดหมู่")} last />
         </section>
         <p className="mb-2 mt-5 px-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">ข้อมูลและความเป็นส่วนตัว</p>

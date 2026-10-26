@@ -21,7 +21,7 @@ This is the canonical project structure. Start with task-relevant files below. O
 - `vite.config.ts` - Vite configuration with React, Tailwind CSS v4, and Figma Make plugins plus the `@` alias for `src`
 - `.mise.toml` - Toolchain versions for Node.js and pnpm
 - `src/api.ts` - Client for the Keeply API at `/api` (same origin; Vite proxies it to `KEEPLY_API_URL` or `localhost:3000` in development)
-- `server/` - Keeply API: Hono on Node with its own `package.json`. Routes in `server/src/index.ts`, MariaDB/MySQL queries in `server/src/db.ts`, tables in `server/schema.sql`
+- `server/` - Keeply API: Hono on Node with its own `package.json`. Routes in `server/src/index.ts`, MariaDB/MySQL queries in `server/src/db.ts`, tables in `server/migrations/*.sql` (applied in order on startup; add a new numbered file rather than editing an applied one)
 - `Dockerfile`, `docker-compose.yml` - Production image that serves the built app and the API from one Node process, plus MariaDB. Settings come from `.env` (see `.env.example`)
 
 ## Dependencies
